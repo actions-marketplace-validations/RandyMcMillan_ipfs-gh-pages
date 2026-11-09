@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -14,6 +18,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Build via packaged action
         uses: ./
@@ -25,3 +31,5 @@ jobs:
         run: |
           test -f "${{ github.workspace }}/action-dist/index.html"
           echo "Bundle OK"
+          test -f "${{ github.workspace }}/actions-test/actions-test.car"
+          echo "Submodule CAR OK"

@@ -52,6 +52,7 @@ npm run test:download # download flow
 npm run test:share    # share link: two headless browsers, auto-connect via ?connect=
 node tests/cdp-ui.mjs # UI chrome regression tests (dropdown, tabs, blob view, theme)
 node tests/car.test.mjs  # CAR round-trip: export/import with locked deps only
+npm run test:gateway  # public gateway reachability for the repo root (needs a provider)
 
 ## Submodules & releases
 
@@ -69,6 +70,10 @@ Release procedure with submodules:
    tracked files change.
 3. CI checkouts that don't initialize submodules skip the submodule
    CARs gracefully; the main `dist/ipfs-gh-pages.car` is unaffected.
+
+Releases are cut with `npm run release <version>` — it bumps,
+commits, tags, and pushes this repo AND tags the actions-test
+submodule at the gitlink's commit, keeping its tags in lockstep.
 node tests/cdp-ui.mjs # UI chrome regression tests (dropdown, tabs, blob view, theme)
 ```
 
@@ -107,7 +112,7 @@ jobs:
 
       - name: Build and deploy IPFS site
         id: deploy
-        uses: RandyMcMillan/ipfs-gh-pages@v1.6.35
+        uses: RandyMcMillan/ipfs-gh-pages@v1.6.38
         with:
           node-version: '20'
           deploy: 'true'
