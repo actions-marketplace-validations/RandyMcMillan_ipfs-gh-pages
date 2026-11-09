@@ -1620,9 +1620,26 @@ async function autoConnectFromUrl() {
   }
 }
 
+// Color the "Connect to Bootstrap Peers" button from the live connect status:
+// green when connected, yellow while connecting/retrying, red otherwise.
+function updateBootstrapBtnState() {
+  if (!bootstrapBtn) return;
+  const s = connectStatus.textContent || '';
+  bootstrapBtn.classList.remove('connected', 'connecting', 'disconnected');
+  if (s.startsWith('Connected to')) {
+    bootstrapBtn.classList.add('connected');
+  } else if (/Connecting|Retrying|Probing|Resolving/.test(s)) {
+    bootstrapBtn.classList.add('connecting');
+  } else {
+    bootstrapBtn.classList.add('disconnected');
+  }
+}
+updateBootstrapBtnState();
+
 // Periodically refresh peers + enable share buttons once a circuit address exists
 setInterval(() => {
   refreshPeers();
+  updateBootstrapBtnState();
   const ma = getShareableMultiaddr();
   if (ma) {
     if (copyMultiaddrBtn) copyMultiaddrBtn.disabled = false;
@@ -1661,6 +1678,27 @@ setInterval(() => {
         const cmd = `ipfs swarm connect '${ma}'\nipfs pin add ${published}`;
         if (docPublish.textContent !== cmd) docPublish.textContent = cmd;
       }
+    }
+    // Mapping chips (design objective 2): Kubo equivalent at the control.
+    const chipCar = document.getElementById('chip-car-export');
+    if (chipCar) {
+      const root = cloneCidEl?.textContent.trim();
+      if (root && root.startsWith('baf')) {
+        const cmd = `ipfs dag export ${root}`;
+        if (chipCar.textContent !== cmd) chipCar.textContent = cmd;
+      }
+    }
+    const chipFetch = document.getElementById('chip-fetch-get');
+    if (chipFetch && inputCid) {
+      const cid = inputCid.value.trim();
+      const cmd = `ipfs get ${cid && /^[a-z0-9]+$/i.test(cid) ? cid : '<CID>'}`;
+      if (chipFetch.textContent !== cmd) chipFetch.textContent = cmd;
+    }
+    const chipSwarm = document.getElementById('chip-swarm-connect');
+    if (chipSwarm && inputMultiaddr) {
+      const ma = inputMultiaddr.value.trim();
+      const cmd = ma ? `ipfs swarm connect '${ma}'` : "ipfs swarm connect '<multiaddr>'";
+      if (chipSwarm.textContent !== cmd) chipSwarm.textContent = cmd;
     }
     // Publish tab help: pin command + full gateway URL once something is published.
     const publishHelp = document.getElementById('publish-help');

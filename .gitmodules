@@ -1,6 +1,4 @@
-[submodule "cli"]
-	path = cli
-	url = https://github.com/RandyMcMillan/helia-cli.git
 [submodule "actions-test"]
 	path = actions-test
-	url = https://github.com/RandyMcMillan/-ipfs-gh-pages-actions-test.git
+	url = https://github.com/RandyMcMillan/ipfs-gh-pages-actions-test.git
+	ignore = untracked
