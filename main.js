@@ -1,5 +1,7 @@
 import '@primer/css/dist/primer.css';
 import { createHelia } from 'helia';
+import { car } from '@helia/car';
+import { CarWriter } from '@ipld/car/writer';
 import repoIdentity from 'virtual:repo-identity';
 import { strings } from '@helia/strings';
 import { unixfs } from '@helia/unixfs';
@@ -202,6 +204,7 @@ refreshRepoMetadata();
 let heliaNode = null;
 let heliaStrings = null;
 let heliaUnixfs = null;
+let heliaCar = null;
 const repoTreeCids = new Map();
 let lastFetchedBytes = null;
 let lastFetchedName = 'ipfs-content';
@@ -256,6 +259,7 @@ const downloadRepoBtn = document.getElementById('btn-download-repo');
 const fileActionStatus = document.getElementById('file-action-status');
 const cloneCidEl = document.getElementById('clone-cid');
 const cloneZipBtn = document.getElementById('btn-clone-zip');
+const carDownloadBtn = document.getElementById('btn-clone-car');
 const cloneCidCopyBtn = document.getElementById('btn-clone-cid-copy');
 const cloneStatus = document.getElementById('clone-status');
 const codeBtn = document.getElementById('btn-code');
@@ -541,6 +545,69 @@ if (blobDownloadBtn) {
   });
 }
 
+// Export a CID (and its full DAG) as CAR bytes. CarWriter streams block
+// chunks through an async iterable; collect them into one buffer.
+async function exportCarBytes(rootCid) {
+  const { writer, out } = await CarWriter.create([rootCid]);
+  const chunks = [];
+  const collect = (async () => {
+    for await (const chunk of out) chunks.push(chunk);
+  })();
+  await heliaCar.export(rootCid, writer);
+  await collect;
+  const total = chunks.reduce((n, c) => n + c.length, 0);
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return bytes;
+}
+
+// Publish tab: download the published content as a CAR.
+const publishCarBtn = document.getElementById('btn-publish-car');
+if (publishCarBtn) {
+  publishCarBtn.addEventListener('click', async () => {
+    const published = document.getElementById('output-cid')?.dataset.published
+      ? document.getElementById('output-cid').textContent.trim()
+      : null;
+    if (!published || !heliaCar) return;
+    publishCarBtn.disabled = true;
+    try {
+      const bytes = await exportCarBytes(CID.parse(published));
+      downloadBytes(bytes, `${published}.car`);
+    } finally {
+      publishCarBtn.disabled = false;
+    }
+  });
+}
+
+// Download CAR: export the whole repo (exact root CID) as a CAR archive.
+if (carDownloadBtn) {
+  carDownloadBtn.addEventListener('click', async () => {
+    const rootCid = outputCid.textContent.trim();
+    if (!rootCid || rootCid === 'None' || !heliaCar) return;
+    carDownloadBtn.disabled = true;
+    if (cloneStatus) {
+      cloneStatus.style.color = 'var(--color-success-fg)';
+      cloneStatus.textContent = 'Building CAR...';
+    }
+    try {
+      const bytes = await exportCarBytes(CID.parse(rootCid));
+      downloadBytes(bytes, `${rootCid}.car`);
+      if (cloneStatus) cloneStatus.textContent = `Downloaded ${rootCid}.car (${formatSize(bytes.length)})`;
+    } catch (err) {
+      if (cloneStatus) {
+        cloneStatus.style.color = 'var(--color-danger-fg)';
+        cloneStatus.textContent = `CAR export failed: ${err.message}`;
+      }
+    } finally {
+      carDownloadBtn.disabled = false;
+    }
+  });
+}
+
 function renderRepoTable(nodes, depth = 0) {
   const ul = document.createElement('ul');
   ul.className = 'repo-table' + (depth > 0 ? ' nested' : '');
@@ -709,6 +776,7 @@ async function addAllRepoFiles() {
         cloneCidEl.title = rootCidStr;
       }
       if (cloneZipBtn) cloneZipBtn.disabled = false;
+      if (carDownloadBtn) carDownloadBtn.disabled = false;
       if (fetchRepoBtn) fetchRepoBtn.disabled = false;
       if (downloadRepoBtn) downloadRepoBtn.disabled = false;
       statusEl.textContent = 'Online & All repository files added to IPFS';
@@ -759,6 +827,7 @@ async function initHelia() {
     heliaNode = await createHelia();
     heliaStrings = strings(heliaNode);
     heliaUnixfs = unixfs(heliaNode);
+    heliaCar = car(heliaNode);
     window.__heliaNode = heliaNode;
 
     const peerId = heliaNode.libp2p.peerId.toString();
@@ -861,7 +930,11 @@ publishBtn.addEventListener('click', async () => {
   try {
     const cid = await heliaStrings.add(text);
     outputCid.textContent = cid.toString();
+    outputCid.dataset.published = '1';
     inputCid.value = cid.toString();
+    window.__lastPublishedSlug = text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'published';
+    const help = document.getElementById('publish-help');
+    if (help) help.style.display = 'block';
   } catch (err) {
     outputCid.textContent = `Error publishing: ${err.message}`;
   } finally {
@@ -1558,6 +1631,72 @@ setInterval(() => {
     if (codeMultiaddrField && !codeMultiaddrField.value) codeMultiaddrField.value = ma;
     if (codeShareField && !codeShareField.value) codeShareField.value = buildShareLink() || '';
     if (shareLinkField && !shareLinkField.value) shareLinkField.value = buildShareLink() || '';
+    const docSwarm = document.getElementById('doc-swarm-cmd');
+    if (docSwarm) {
+      const root = (cloneCidEl && cloneCidEl.textContent.trim()) || '<root CID from the Clone bar>';
+      const cmd = `ipfs swarm connect '${ma}'\nipfs pin add ${root}`;
+      if (docSwarm.textContent !== cmd) docSwarm.textContent = cmd;
+    }
+    const docGet = document.getElementById('doc-get-cmd');
+    if (docGet) {
+      const root = cloneCidEl?.textContent.trim();
+      if (root && root.startsWith('baf')) {
+        const cmd = `ipfs get ${root}`;
+        if (docGet.textContent !== cmd) docGet.textContent = cmd;
+      }
+    }
+    const docPin = document.getElementById('doc-pin-cmd');
+    if (docPin) {
+      const root = cloneCidEl?.textContent.trim();
+      if (root && root.startsWith('baf')) {
+        const cmd = `ipfs pin add ${root}`;
+        if (docPin.textContent !== cmd) docPin.textContent = cmd;
+      }
+    }
+    const docPublish = document.getElementById('doc-publish-cmd');
+    if (docPublish) {
+      const publishedEl = document.getElementById('output-cid');
+      const published = publishedEl?.dataset.published ? publishedEl.textContent.trim() : null;
+      if (published && published.startsWith('baf')) {
+        const cmd = `ipfs swarm connect '${ma}'\nipfs pin add ${published}`;
+        if (docPublish.textContent !== cmd) docPublish.textContent = cmd;
+      }
+    }
+    // Publish tab help: pin command + full gateway URL once something is published.
+    const publishHelp = document.getElementById('publish-help');
+    if (publishHelp && publishHelp.style.display !== 'none') {
+      const publishedEl = document.getElementById('output-cid');
+      const published = publishedEl?.dataset.published ? publishedEl.textContent.trim() : null;
+      if (published) {
+        const slug = (window.__lastPublishedSlug || 'published');
+        const host = (document.getElementById('settings-rpc-host')?.value.trim()) || '127.0.0.1';
+        const pinCmd = document.getElementById('publish-pin-cmd');
+        if (pinCmd) {
+          const cmd = `ipfs swarm connect '${ma}'\nipfs pin add ${published}`;
+          if (pinCmd.textContent !== cmd) pinCmd.textContent = cmd;
+        }
+        const gw = document.getElementById('publish-gateway-url');
+        if (gw) {
+          const url = `http://${host}:8080/ipfs/${published}?filename=${slug}`;
+          if (gw.textContent !== url) gw.textContent = url;
+        }
+        const pubPath = document.getElementById('publish-public-path-url');
+        if (pubPath) {
+          const url = `https://ipfs.io/ipfs/${published}?filename=${slug}`;
+          if (pubPath.textContent !== url) pubPath.textContent = url;
+        }
+        const pubSub = document.getElementById('publish-public-subdomain-url');
+        if (pubSub) {
+          const url = `https://${published}.ipfs.dweb.link?filename=${slug}`;
+          if (pubSub.textContent !== url) pubSub.textContent = url;
+        }
+        const carImport = document.getElementById('publish-car-import-cmd');
+        if (carImport) {
+          const cmd = `ipfs dag import ${published}.car`;
+          if (carImport.textContent !== cmd) carImport.textContent = cmd;
+        }
+      }
+    }
   }
 }, 2000);
 
