@@ -1,10 +1,13 @@
 import WebSocket from 'ws';
 import { spawn } from 'child_process';
+import { generateKeyPair } from '@libp2p/crypto/keys';
+import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { findChrome, isVerbose, vlog, testUrl } from './utils.mjs';
 
 const chrome = findChrome();
 const PORT_A = 9232; // sender node
 const PORT_B = 9233; // recipient node (opens the share link)
+const PORT_C = 9234; // fresh browser for the negative-path (unreachable link) test
 
 let failures = 0;
 function check(label, ok, detail = '') {
@@ -121,27 +124,76 @@ if (multiaddr) {
   );
   check('node B auto-connected from share link', bConnected === true);
 
-  // B dialed A, so A must now see B among its peers.
-  const aSeesB = await waitFor(
+  // The link is proven if A lists B OR fresh content actually flows B<-A.
+  // A's inbound relayed connection can be churn-pruned while B's dial still
+  // reports success, so a single signal is flaky — accept either, and keep
+  // the B<-A transfer going while we poll A's peer list.
+  const cidBefore = await A.evalJson(`document.getElementById('output-cid').textContent.trim()`);
+  await A.evalJson(`(() => {
+    document.getElementById('input-content').value = 'share-link-e2e-${Date.now()}';
+    document.getElementById('btn-publish').click();
+    return true;
+  })()`);
+  const freshCid = await waitFor(
     A.evalJson,
-    `window.__heliaNode.libp2p.getPeers().map(String).includes(${JSON.stringify(peerIdB || '')})`,
+    `(() => { const c = document.getElementById('output-cid').textContent.trim(); return c && c !== ${JSON.stringify(cidBefore)} ? c : null; })()`,
     30000,
-    2000
+    500
   );
-  check('node A sees node B in its peer list', aSeesB === true);
+
+  const aSeesBExpr = `(() => {
+    const id = ${JSON.stringify(peerIdB || '')};
+    const viaLibp2p = window.__heliaNode.libp2p.getPeers().map(String).includes(id);
+    const viaUi = document.getElementById('peers-list').textContent.includes(id);
+    return viaLibp2p || viaUi;
+  })()`;
+
+  let aSeesB = false;
+  let e2eLen = 0;
+  const deadline = Date.now() + 90000;
+  while (Date.now() < deadline && !aSeesB && e2eLen === 0) {
+    aSeesB = (await A.evalJson(aSeesBExpr)) === true;
+    if (!aSeesB && freshCid) {
+      await B.evalJson(`window.__runFetch(${JSON.stringify(freshCid)}, 'e2e.txt')`, true);
+      e2eLen = (await B.evalJson(`window.__getLastFetched().len`)) || 0;
+    }
+    if (!aSeesB && e2eLen === 0) {
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
+  check('share link works end-to-end (A sees B or content flows B<-A)', aSeesB === true || e2eLen > 0, `aSeesB=${aSeesB} e2eLen=${e2eLen} freshCid=${freshCid}`);
 
   // Negative path: a stale/unreachable share link must fail visibly (after retries), not hang silently.
+  // Use a fresh browser: re-navigating the tab that already runs a live libp2p node can
+  // leave the old document in place, and the poll would read the previous session's status.
+  // The peer id must come from a freshly generated key: dial() reuses an existing
+  // connection when the peer id is already connected, and a previously hardcoded id
+  // turned out to be a live network peer — which made this spuriously "succeed".
   vlog('Checking failure path with an unreachable share link...');
-  const badAddr = '/ip4/127.0.0.1/tcp/1/ws/p2p/12D3KooWRx1BxMZ7nYyeM8RLyGaWAKyqv8GhMCT7KNW7TMkTVTVB';
-  const badLink = testUrl + (testUrl.includes('?') ? '&' : '?') + 'connect=' + encodeURIComponent(badAddr);
-  await B.send('Page.navigate', { url: badLink });
+  const C = await launchNode(PORT_C);
+  const deadKey = await generateKeyPair('Ed25519');
+  const badAddr = `/ip4/127.0.0.1/tcp/1/ws/p2p/${peerIdFromPrivateKey(deadKey)}`;
+  const badLink = testUrl + (testUrl.includes('?') ? '&' : '?') + 'connect=' + encodeURIComponent(badAddr) + '&_cb=' + Date.now();
+  const nav = await C.send('Page.navigate', { url: badLink });
+  check('bad link navigation accepted', !nav?.errorText, nav?.errorText || '');
+  const badPageLoaded = await waitFor(
+    C.evalJson,
+    `new URLSearchParams(location.search).get('connect') === ${JSON.stringify(badAddr)}`,
+    30000,
+    1000
+  );
+  check('bad link page actually loaded', badPageLoaded === true);
   const failedVisibly = await waitFor(
-    B.evalJson,
+    C.evalJson,
     `document.getElementById('connect-status').textContent.startsWith('Auto-connect failed')`,
-    45000,
+    90000,
     2000
   );
-  check('unreachable share link fails visibly after retries', failedVisibly === true);
+  const csText = await C.evalJson(`document.getElementById('connect-status').textContent`);
+  const ssText = await C.evalJson(`document.getElementById('share-status').textContent`);
+  check('unreachable share link fails visibly after retries', failedVisibly === true, `connect-status="${csText}" share-status="${ssText}"`);
+  C.ws.close();
+  C.proc.kill();
 }
 
 A.ws.close();

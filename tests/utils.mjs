@@ -42,3 +42,36 @@ export function findChrome() {
   }
   return candidates[0];
 }
+
+let failures = 0;
+
+export function check(label, ok, detail = '') {
+  if (ok) {
+    console.log(`PASS: ${label}`);
+  } else {
+    failures++;
+    console.log(`FAIL: ${label}${detail ? ' — ' + detail : ''}`);
+  }
+}
+
+export function finish(testName) {
+  if (failures > 0) {
+    console.log(`${testName}: ${failures} failure(s)`);
+    process.exit(1);
+  }
+  console.log(`${testName}: all checks passed`);
+  process.exit(0);
+}
+
+export async function waitForDebugger(port, timeoutMs = 45000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const targets = await fetch(`http://127.0.0.1:${port}/json`).then((r) => r.json());
+      const page = targets.find((t) => t.type === 'page');
+      if (page) return page;
+    } catch {}
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  throw new Error(`Chrome DevTools endpoint not reachable on port ${port}`);
+}

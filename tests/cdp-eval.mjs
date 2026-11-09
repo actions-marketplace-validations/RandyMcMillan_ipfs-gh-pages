@@ -1,15 +1,13 @@
 import WebSocket from 'ws';
 import { spawn } from 'child_process';
-import { tmpDir, findChrome, isVerbose, vlog, testUrl } from './utils.mjs';
+import { tmpDir, findChrome, isVerbose, vlog, testUrl, check, finish, waitForDebugger } from './utils.mjs';
 
 const chrome = findChrome();
 vlog('Using Chrome:', chrome);
 const proc = spawn(chrome, ['--headless=new', '--disable-gpu', '--remote-debugging-port=9225'], { stdio: 'ignore' });
 
 vlog('Waiting for Chrome DevTools Protocol...');
-await new Promise(r => setTimeout(r, 6000));
-const targets = await fetch('http://127.0.0.1:9225/json').then(r => r.json());
-const page = targets.find(t => t.type === 'page');
+const page = await waitForDebugger(9225);
 const ws = new WebSocket(page.webSocketDebuggerUrl);
 await new Promise((res, rej) => { ws.on('open', res); ws.on('error', rej); });
 vlog('CDP WebSocket connected');
@@ -42,9 +40,9 @@ for (let i = 0; i < 60; i++) {
 }
 
 const expr = `(() => {
-  const spans = Array.from(document.querySelectorAll('#file-tree span'));
-  const s = spans.find(x => x.textContent.includes('index.html'));
-  const m = s.textContent.match(/(baf[a-z0-9]+)/);
+  const li = Array.from(document.querySelectorAll('#file-tree li.row')).find(x => x.textContent.includes('index.html'));
+  const cidEl = li && li.querySelector('.cell-cid');
+  const m = cidEl && cidEl.textContent.trim().match(/^(baf[a-z0-9]+)/);
   return m ? m[1] : null;
 })()`;
 const cid = (await send('Runtime.evaluate', { expression: expr, returnByValue: true }))?.result?.value;
@@ -61,7 +59,8 @@ const r = await send('Runtime.evaluate', {
 });
 console.log('LAST FETCHED:', r?.result?.value);
 
-vlog('Cleaning up Chrome process');
-ws.close();
-proc.kill();
-process.exit(0);
+const info = JSON.parse(r?.result?.value || 'null');
+check('index.html CID extracted from tree', /^baf[a-z0-9]+$/.test(cid || ''), `cid=${cid}`);
+check('fetched bytes look like the app shell (len > 5000)', info?.len > 5000, `len=${info?.len}`);
+check('fetched name is index.html', info?.name === 'index.html', `name=${info?.name}`);
+finish('EVAL TEST');

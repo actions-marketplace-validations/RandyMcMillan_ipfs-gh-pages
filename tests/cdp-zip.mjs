@@ -1,15 +1,13 @@
 import WebSocket from 'ws';
 import { spawn } from 'child_process';
-import { tmpDir, findChrome, isVerbose, vlog, testUrl } from './utils.mjs';
+import { tmpDir, findChrome, isVerbose, vlog, testUrl, check, finish, waitForDebugger } from './utils.mjs';
 
 const chrome = findChrome();
 vlog('Using Chrome:', chrome);
 const proc = spawn(chrome, ['--headless=new', '--disable-gpu', '--remote-debugging-port=9226'], { stdio: 'ignore' });
 
 vlog('Waiting for Chrome DevTools Protocol...');
-await new Promise(r => setTimeout(r, 6000));
-const targets = await fetch('http://127.0.0.1:9226/json').then(r => r.json());
-const page = targets.find(t => t.type === 'page');
+const page = await waitForDebugger(9226);
 const ws = new WebSocket(page.webSocketDebuggerUrl);
 await new Promise((res, rej) => { ws.on('open', res); ws.on('error', rej); });
 vlog('CDP WebSocket connected');
@@ -47,7 +45,6 @@ vlog('Collecting ZIP size for', rootCid);
 const size = (await send('Runtime.evaluate', { expression: `window.__collectZipSize(${JSON.stringify(rootCid)})`, awaitPromise: true, returnByValue: true }))?.result?.value;
 console.log('ZIP SIZE:', size);
 
-vlog('Cleaning up Chrome process');
-ws.close();
-proc.kill();
-process.exit(0);
+check('root CID is a CIDv1 string', /^baf[a-z0-9]+$/.test(rootCid || ''), `rootCid=${rootCid}`);
+check('repo zip is non-trivial (> 500 bytes)', typeof size === 'number' && size > 500, `size=${size}`);
+finish('ZIP TEST');
