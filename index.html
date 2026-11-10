@@ -1015,10 +1015,20 @@
               <span class="mx-1">Code</span>
               <svg height="16" width="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="m4.427 7.427 3.396 3.396a.25.25 0 0 0 .354 0l3.396-3.396A.25.25 0 0 0 11.396 7H4.604a.25.25 0 0 0-.177.427Z"></path></svg>
             </button>
-            <div id="code-dropdown" class="dropdown-menu dropdown-menu-sw" style="display: none; position: absolute; z-index: 100; width: 380px; right: 0; left: auto; top: calc(100% + 4px); padding: 1rem;">
+            <div id="code-dropdown" class="dropdown-menu dropdown-menu-sw" style="display: none; position: absolute; z-index: 100; width: min(380px, calc(100vw - 1rem)); right: 0; left: auto; top: calc(100% + 4px); padding: 1rem;">
               <div class="tab-bar" style="margin-bottom: 0.75rem; border-bottom: 1px solid var(--color-border-muted);">
                 <button class="tab-button active" type="button" data-codetab="link" id="codetab-btn-link">Share Link</button>
                 <button class="tab-button" type="button" data-codetab="multiaddr" id="codetab-btn-multiaddr">Multiaddr</button>
+                <button class="tab-button" type="button" data-codetab="ipns" id="codetab-btn-ipns">IPNS</button>
+              </div>
+              <div id="codetab-panel-ipns" style="display: none;">
+                <div class="input-group">
+                  <input id="code-ipns-field" readonly type="text" class="form-control input-monospace" placeholder="/ipns/… appears once the repo root is published" title="IPNS branch pointer — tracks the repo root CID while this page is open" />
+                  <span class="input-group-button">
+                    <button id="btn-code-copy-ipns" class="btn" type="button">Copy</button>
+                  </span>
+                </div>
+                <small style="margin-top: 0.5rem;">Branch pointer: resolves to the current repo root CID while this page is open and republishing.</small>
               </div>
               <div id="codetab-panel-link">
                 <div class="input-group">
@@ -1048,7 +1058,23 @@
                   Download CAR
                 </button>
               </div>
-              <code class="kubo-chip" id="chip-car-export">ipfs dag export &lt;root CID&gt;</code>
+              <div style="border-top: 1px solid var(--color-border-muted); margin-top: 0.75rem; padding-top: 0.5rem;">
+                <div class="d-flex flex-items-center flex-wrap" style="gap: 0.5rem;">
+                  <button id="btn-remote-pin" class="btn btn-sm" type="button" disabled title="Pin the repo root CID to a remote pinning service (Pinning Services API) — the durable, network-wide &quot;star&quot;">☆ Remote pin</button>
+                  <span id="remote-pin-status" class="f6 color-fg-muted" style="word-break: break-all;"></span>
+                </div>
+                <details style="margin-top: 0.4rem;">
+                  <summary class="f6 color-fg-muted" style="cursor: pointer;">Pinning service settings</summary>
+                  <label class="f6 d-block" style="margin-top: 0.4rem;">Endpoint (full /pins URL)</label>
+                  <input id="remote-pin-endpoint" type="text" class="form-control input-monospace" style="width: 100%;" placeholder="https://api.web3.storage/pins" />
+                  <label class="f6 d-block" style="margin-top: 0.4rem;">Bearer token</label>
+                  <input id="remote-pin-token" type="password" class="form-control input-monospace" style="width: 100%;" placeholder="Paste your pinning service token" />
+                  <div class="d-flex flex-items-center" style="gap: 0.5rem; margin-top: 0.5rem;">
+                    <button id="btn-remote-pin-save" class="btn btn-sm" type="button">Save</button>
+                    <span class="f6 color-fg-muted">Saved only in this browser. If the service rejects browser calls (CORS), use the curl in the help modal.</span>
+                  </div>
+                </details>
+              </div>
               <p id="clone-status" class="f6 status" style="margin: 0.5rem 0 0; word-break: break-all;"></p>
             </div>
           </div>
@@ -1144,6 +1170,13 @@
             <div class="lang-bar" id="lang-bar"><span class="lang-js" style="width: 100%;"></span></div>
             <div class="f6" id="lang-legend"><span class="lang-dot"></span>JavaScript 100.0%</div>
           </div>
+          <div class="sidebar-section border-top pt-3">
+            <div class="sidebar-heading">
+              <h2>Contributors</h2>
+            </div>
+            <p class="f6 color-fg-muted" style="margin-bottom: 0.35rem;">Peers providing this repo right now:</p>
+            <div class="f6" id="contributors-list">(none yet — pin the repo on a Kubo to appear here)</div>
+          </div>
         </aside>
         </div>
       </section>
@@ -1153,7 +1186,10 @@
           <h3>Node Status</h3>
           <p>Status: <span id="node-status" class="status">Initializing Helia IPFS Node...</span></p>
           <p>Peer ID: <code id="peer-id">...</code></p>
-          <p>Multiaddrs: <code id="multiaddrs">...</code></p>
+          <details>
+            <summary style="cursor: pointer;">Multiaddrs</summary>
+            <div id="multiaddrs-list" style="margin-top: 0.25rem;">...</div>
+          </details>
         </div>
 
         <div class="card">
@@ -1187,8 +1223,18 @@
             <button id="btn-copy-link" disabled>Copy Share Link</button>
             <p id="share-status"></p>
 
-            <h4 style="margin-top:1rem;">Connected Peers</h4>
-            <ul id="peers-list"><li>(none)</li></ul>
+            <details style="margin-top:1rem;">
+              <summary style="cursor: pointer; font-weight: 600;">Connected Peers (<span id="peer-count">0</span>)</summary>
+              <ul id="peers-list"><li>(none)</li></ul>
+            </details>
+            <details style="margin-top:0.5rem;">
+              <summary style="cursor: pointer; font-weight: 600;">Clones (<span id="clones-count">0</span>)</summary>
+              <ul id="clones-list"><li>(none yet — open the page in another browser)</li></ul>
+            </details>
+            <details style="margin-top:0.5rem;">
+              <summary style="cursor: pointer; font-weight: 600;">Blocked (<span id="blocked-count">0</span>)</summary>
+              <ul id="blocked-peers-list"><li>(none)</li></ul>
+            </details>
 
             <div class="help" style="margin-top:1rem;">
               <h4 style="margin-top:0;">Reference — Peer actions ↔ Kubo</h4>
@@ -1401,6 +1447,11 @@ ipfs daemon</pre>
             <pre style="margin: 0.4rem 0;"><code id="publish-public-path-url"></code></pre>
             <p><strong>Public gateway, subdomain link</strong> — origin-isolated; prefer this for web-app content:</p>
             <pre style="margin: 0.4rem 0;"><code id="publish-public-subdomain-url"></code></pre>
+            <p><strong>Trustless CAR</strong> — a verifiable archive from any trustless-capable gateway; the content hash proves authenticity, so it works for software supply chains, not just viewing:</p>
+            <pre style="margin: 0.4rem 0;"><code id="publish-trustless-path-url"></code></pre>
+            <pre style="margin: 0.4rem 0;"><code id="publish-trustless-subdomain-url"></code></pre>
+            <p>Fetch and import it on any Kubo (the gateway never has to be trusted):</p>
+            <pre style="margin: 0.4rem 0;"><code id="publish-trustless-curl-cmd"></code></pre>
             <p style="margin-bottom: 0;">Adjust the local port if your gateway isn't the default (check <code>ipfs config Addresses.Gateway</code>). Public gateways only work while the content is pinned somewhere reachable.</p>
             <p style="margin-bottom: 0;">Tip: install the <a href="https://docs.ipfs.tech/install/ipfs-companion/" target="_blank" rel="noopener">IPFS Companion</a> browser extension and these gateway links open through your local Kubo instead of the public gateway.</p>
           </div>
@@ -1465,6 +1516,8 @@ ipfs pin add &lt;root CID from the Clone bar&gt;</code></pre>
         <p>Done — your Kubo now seeds the repo to the whole network (DHT), so anyone can fetch it:</p>
         <pre><code>ipfs get &lt;root CID&gt;</code></pre>
         <p><strong>Don't</strong> <code>ipfs add -r</code> a checkout to reproduce the CID: Kubo's UnixFS layout can differ from the browser's and produce a different CID. Import via <code>swarm connect</code> + <code>pin add</code> so the Clone-bar CID stays the authoritative one.</p>
+        <p>The <strong>Download CAR</strong> button in the Code dropdown is the browser equivalent of Kubo's archive export — identical content, exact root CID:</p>
+        <code class="kubo-chip" id="chip-car-export">ipfs dag export &lt;root CID&gt;</code>
 
         <h4>Connect your Kubo to this page (Kubo → page)</h4>
         <p style="color: var(--fgColor-attention);"><strong>Kubo needs a browser-dialable transport.</strong> From this repo on the Kubo machine, pick ONE:</p>
@@ -1507,6 +1560,12 @@ ipfs pin add &lt;CID from the Publish tab&gt;</code></pre>
         <p><span style="color: var(--fgColor-attention);"><strong>IPFS keeps only what someone pins.</strong></span> The browser announces the repo to the delegated index <strong>while the page is open</strong>.<br><strong>A closed tab stops serving.</strong><br>For durable availability, pin the root CID on your Kubo:</p>
         <pre><code id="doc-pin-cmd">ipfs pin add &lt;root CID&gt;</code></pre>
         <p>The Pin row in the Clone bar and this section are the same command.</p>
+        <p>No Kubo of your own? Use the Code dropdown's <strong>☆ Remote pin</strong> to pin to any Pinning Services API provider (web3.storage, Pinata, …). From a terminal the same request is:</p>
+        <pre><code>curl -X POST "https://&lt;endpoint&gt;/pins" \
+  -H "Authorization: Bearer &lt;token&gt;" \
+  -H "Content-Type: application/json" \
+  -d '{"cid":"&lt;root CID&gt;","name":"&lt;repo&gt;"}'</code></pre>
+        <p>Pinning services fetch the CID from your browser node while this page is open — include a <code>?connect=</code> share link when you want them to find it, or pin again once it is on your Kubo.</p>
 
         <h4>Reference — this page ↔ IPFS ↔ Kubo</h4>
         <p>Every feature here has a canonical counterpart in the IPFS ecosystem:</p>

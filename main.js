@@ -1,5 +1,11 @@
 import '@primer/css/dist/primer.css';
-import { createHelia } from 'helia';
+import { createHelia, libp2pDefaults } from 'helia';
+import { createLibp2p } from 'libp2p';
+import { gossipsub } from '@chainsafe/libp2p-gossipsub';
+import { pubsubPeerDiscovery } from '@libp2p/pubsub-peer-discovery';
+import { ipns } from '@helia/ipns';
+import { generateKeyPair, privateKeyFromRaw } from '@libp2p/crypto/keys';
+import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { car } from '@helia/car';
 import { CarWriter } from '@ipld/car/writer';
 import repoIdentity from 'virtual:repo-identity';
@@ -9,7 +15,7 @@ import { CID } from 'multiformats/cid';
 import repoFiles from 'virtual:repo-files';
 import { zipSync } from 'fflate';
 import { multiaddr } from '@multiformats/multiaddr';
-import { formatSize, base64ToUint8Array, buildRepoTree, isBrowserDialable, normalizeAddressForProxy } from './lib/shared.mjs';
+import { formatSize, base64ToUint8Array, uint8ArrayToBase64, buildRepoTree, isBrowserDialable, normalizeAddressForProxy } from './lib/shared.mjs';
 
 // Repo identity: prefer the Pages origin (<owner>.github.io/<repo>), then the
 // build-time identity baked by the action (GITHUB_REPOSITORY / git remote), so
@@ -24,7 +30,7 @@ const { repoOwner, repoName } = (() => {
   if (repoIdentity.owner && repoIdentity.name) {
     return { repoOwner: repoIdentity.owner, repoName: repoIdentity.name };
   }
-  return { repoOwner: 'RandyMcMillan', repoName: 'ipfs-gh-pages' };
+  return { repoOwner: 'gnostr', repoName: 'gnostr-repo' };
 })();
 const repoFullName = `${repoOwner}/${repoName}`;
 const repoUrl = `https://github.com/${repoFullName}`;
@@ -222,7 +228,7 @@ const repoTreeSizes = new Map();
 
 const statusEl = document.getElementById('node-status');
 const peerIdEl = document.getElementById('peer-id');
-const multiaddrsEl = document.getElementById('multiaddrs');
+const multiaddrsListEl = document.getElementById('multiaddrs-list');
 const connectBtn = document.getElementById('btn-connect');
 const bootstrapBtn = document.getElementById('btn-bootstrap');
 const copyMultiaddrBtn = document.getElementById('btn-copy-multiaddr');
@@ -268,6 +274,21 @@ const codeShareField = document.getElementById('code-share-field');
 const codeMultiaddrField = document.getElementById('code-multiaddr-field');
 const codeCopyLinkBtn = document.getElementById('btn-code-copy-link');
 const codeCopyMultiaddrBtn = document.getElementById('btn-code-copy-multiaddr');
+const remotePinBtn = document.getElementById('btn-remote-pin');
+const remotePinStatus = document.getElementById('remote-pin-status');
+const remotePinEndpointInput = document.getElementById('remote-pin-endpoint');
+const remotePinTokenInput = document.getElementById('remote-pin-token');
+const remotePinSaveBtn = document.getElementById('btn-remote-pin-save');
+const REMOTE_PIN_CFG_KEY = 'remote-pin-config';
+const REMOTE_PIN_LAST_KEY = 'remote-pin-last';
+
+function loadRemotePinConfig() {
+  try { return JSON.parse(localStorage.getItem(REMOTE_PIN_CFG_KEY) || '{}'); } catch { return {}; }
+}
+
+function setRemotePinStatus(msg) {
+  if (remotePinStatus) remotePinStatus.textContent = msg;
+}
 
 function selectFile(cid, name, element) {
   selectedFileCid = cid;
@@ -751,6 +772,57 @@ function renderReadme() {
   }
 }
 
+// IPNS branch pointer: publish the current repo root CID under a
+// browser-held Ed25519 key, so `/ipns/<peerId>` tracks HEAD like a branch
+// ref while the page is open. The key's raw bytes persist in localStorage
+// per repo, so refreshes keep the same name.
+let ipnsBranchKeyPromise = null;
+let ipnsBranchCid = null;
+let ipnsBranchLastPublish = 0;
+let ipnsBranchName = '';
+
+function getIpnsBranchKey() {
+  if (!ipnsBranchKeyPromise) {
+    ipnsBranchKeyPromise = (async () => {
+      const storageKey = `ipns-branch-key:${repoFullName}`;
+      const stored = localStorage.getItem(storageKey);
+      if (stored) {
+        try {
+          return privateKeyFromRaw(base64ToUint8Array(stored));
+        } catch {
+          // corrupted entry — regenerate below
+        }
+      }
+      const key = await generateKeyPair('Ed25519');
+      localStorage.setItem(storageKey, uint8ArrayToBase64(key.raw));
+      return key;
+    })();
+  }
+  return ipnsBranchKeyPromise;
+}
+
+async function publishBranchPointer(rootCid) {
+  const field = document.getElementById('code-ipns-field');
+  try {
+    if (!heliaNode || !rootCid) return;
+    const key = await getIpnsBranchKey();
+    const peerId = peerIdFromPrivateKey(key);
+    const ipnsName = `/ipns/${peerId}`;
+    ipnsBranchCid = rootCid;
+    ipnsBranchName = ipnsName;
+    if (field) {
+      field.value = ipnsName;
+      field.dataset.ipns = ipnsName;
+      field.title = 'IPNS branch pointer — tracks the repo root CID while this page is open. Click to select, then copy.';
+    }
+    await ipns(heliaNode).publish(key, rootCid);
+    ipnsBranchLastPublish = Date.now();
+    if (field) field.title = 'IPNS branch pointer published';
+  } catch (err) {
+    if (field) field.title = `IPNS publish failed: ${err.message} — the name above is still valid once a publisher is online`;
+  }
+}
+
 async function addAllRepoFiles() {
   if (!heliaUnixfs) return;
   statusEl.textContent = 'Adding all repository files to IPFS...';
@@ -779,6 +851,7 @@ async function addAllRepoFiles() {
       if (carDownloadBtn) carDownloadBtn.disabled = false;
       if (fetchRepoBtn) fetchRepoBtn.disabled = false;
       if (downloadRepoBtn) downloadRepoBtn.disabled = false;
+      publishBranchPointer(rootCid).catch(() => {});
       statusEl.textContent = 'Online & All repository files added to IPFS';
 
       // Announce the root CID to the IPFS network so other peers
@@ -823,12 +896,47 @@ async function addAllRepoFiles() {
 
 async function initHelia() {
   try {
-    // Spawn an in-browser IPFS node
-    heliaNode = await createHelia();
+    // Spawn an in-browser IPFS node. Extend helia's own libp2p defaults
+    // with gossipsub for clone detection (a bare services key would
+    // clobber the defaults — identify, dht, ping, etc.), and announce
+    // ourselves on the repo topic so clones discover each other without
+    // a share link.
+    const lpDefaults = libp2pDefaults();
+    const libp2p = await createLibp2p({
+      ...lpDefaults,
+      peerDiscovery: [
+        ...lpDefaults.peerDiscovery,
+        pubsubPeerDiscovery({ topics: [`repo-gossip:${repoFullName}`] })
+      ],
+      services: {
+        ...lpDefaults.services,
+        pubsub: gossipsub({ emitSelf: false })
+      }
+    });
+    heliaNode = await createHelia({ libp2p });
     heliaStrings = strings(heliaNode);
     heliaUnixfs = unixfs(heliaNode);
     heliaCar = car(heliaNode);
     window.__heliaNode = heliaNode;
+
+    // Enforce the persisted peer blocklist on every new connection,
+    // inbound included: blocked peers are closed on sight.
+    heliaNode.libp2p.addEventListener('connection:open', (evt) => {
+      const id = evt.detail.remotePeer.toString();
+      if (isBlockedPeer(id)) {
+        evt.detail.close().catch(() => {});
+      }
+    });
+
+    // Clone detection: every instance of this app subscribes to a gossip
+    // topic named after the repo, so subscribers ARE clones (peers running
+    // the same published app). Unknown deployments share the gnostr default.
+    const pubsub = heliaNode.libp2p.services?.pubsub;
+    if (pubsub) {
+      try {
+        pubsub.subscribe(`repo-gossip:${repoFullName}`);
+      } catch {}
+    }
 
     const peerId = heliaNode.libp2p.peerId.toString();
 
@@ -837,9 +945,9 @@ async function initHelia() {
 
     try {
       const addrs = heliaNode.libp2p.getMultiaddrs().map((a) => a.toString());
-      multiaddrsEl.textContent = addrs.length ? addrs.join(', ') : '(none - browser node)';
+      multiaddrsListEl.textContent = addrs.length ? addrs.join(', ') : '(none - browser node)';
     } catch (e) {
-      multiaddrsEl.textContent = '(unavailable)';
+      multiaddrsListEl.textContent = '(unavailable)';
     }
 
     publishBtn.disabled = false;
@@ -1286,7 +1394,29 @@ if (downloadRepoBtn) {
 if (codeBtn && codeDropdown) {
   codeBtn.addEventListener('click', (e) => {
     e.stopPropagation();
-    codeDropdown.style.display = codeDropdown.style.display === 'none' ? 'block' : 'none';
+    const opening = codeDropdown.style.display === 'none';
+    codeDropdown.style.display = opening ? 'block' : 'none';
+    if (!opening) return;
+    if (window.innerWidth <= 544) {
+      // Narrow screens: pin below the button, spanning the viewport, so the
+      // options are always on screen wherever the toolbar wrapped the button.
+      const r = codeBtn.getBoundingClientRect();
+      codeDropdown.style.position = 'fixed';
+      codeDropdown.style.left = '0.5rem';
+      codeDropdown.style.right = '0.5rem';
+      codeDropdown.style.width = 'auto';
+      codeDropdown.style.top = `${Math.round(r.bottom) + 4}px`;
+      codeDropdown.style.maxHeight = `${Math.max(200, window.innerHeight - r.bottom - 12)}px`;
+      codeDropdown.style.overflowY = 'auto';
+    } else {
+      codeDropdown.style.position = 'absolute';
+      codeDropdown.style.left = 'auto';
+      codeDropdown.style.right = '0';
+      codeDropdown.style.width = 'min(380px, calc(100vw - 1rem))';
+      codeDropdown.style.top = 'calc(100% + 4px)';
+      codeDropdown.style.maxHeight = '';
+      codeDropdown.style.overflowY = '';
+    }
   });
   document.addEventListener('click', (e) => {
     if (codeDropdown.style.display !== 'none' && !codeDropdown.contains(e.target) && e.target !== codeBtn) {
@@ -1305,6 +1435,7 @@ document.querySelectorAll('[data-codetab]').forEach((button) => {
     button.classList.add('active');
     document.getElementById('codetab-panel-link').style.display = tab === 'link' ? 'block' : 'none';
     document.getElementById('codetab-panel-multiaddr').style.display = tab === 'multiaddr' ? 'block' : 'none';
+    document.getElementById('codetab-panel-ipns').style.display = tab === 'ipns' ? 'block' : 'none';
   });
 });
 
@@ -1336,6 +1467,80 @@ if (codeShareField) {
 if (codeMultiaddrField) {
   codeMultiaddrField.addEventListener('click', () => codeMultiaddrField.select());
   codeMultiaddrField.addEventListener('focus', () => codeMultiaddrField.select());
+}
+
+// Remote pin (Pinning Services API) — the GitHub "star" equivalent: pin the
+// repo root CID to a remote pinning service so it outlives this tab. Config
+// persists in localStorage only; the request follows the PSA spec.
+async function remotePinRoot() {
+  const root = cloneCidEl?.textContent.trim();
+  const cfg = loadRemotePinConfig();
+  if (!root || !root.startsWith('baf')) return;
+  if (!cfg.endpoint || !cfg.token) {
+    setRemotePinStatus('Set the endpoint + token below first.');
+    return;
+  }
+  setRemotePinStatus('Pinning…');
+  remotePinBtn.disabled = true;
+  try {
+    const origins = [];
+    const ma = getShareableMultiaddr();
+    if (ma) origins.push(ma);
+    const res = await fetch(cfg.endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${cfg.token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ cid: root, name: repoFullName, origins })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`);
+    const pin = await res.json();
+    try {
+      localStorage.setItem(REMOTE_PIN_LAST_KEY, JSON.stringify({ requestId: pin.requestId, cid: root, endpoint: cfg.endpoint, status: pin.status }));
+    } catch {}
+    setRemotePinStatus(`Pin ${pin.status}${pin.requestId ? ` (${pin.requestId})` : ''}`);
+    remotePinBtn.textContent = '★ Pinned';
+  } catch (err) {
+    setRemotePinStatus(`Pin failed: ${err.message}`);
+  } finally {
+    remotePinBtn.disabled = false;
+  }
+}
+
+// Restore the last pin's status (best effort — the service may want fresh auth).
+(async () => {
+  try {
+    const last = JSON.parse(localStorage.getItem(REMOTE_PIN_LAST_KEY) || 'null');
+    if (!last?.requestId || !last?.endpoint) return;
+    const res = await fetch(`${last.endpoint.replace(/\/$/, '')}/${last.requestId}`, {
+      headers: { Authorization: `Bearer ${loadRemotePinConfig().token || ''}` }
+    });
+    if (!res.ok) return;
+    const pin = await res.json();
+    last.status = pin.status;
+    localStorage.setItem(REMOTE_PIN_LAST_KEY, JSON.stringify(last));
+    setRemotePinStatus(`Pin ${pin.status} (${last.cid})`);
+    if (pin.status === 'pinned' && remotePinBtn) remotePinBtn.textContent = '★ Pinned';
+  } catch {}
+})();
+
+if (remotePinSaveBtn) {
+  const cfg = loadRemotePinConfig();
+  if (remotePinEndpointInput) remotePinEndpointInput.value = cfg.endpoint || '';
+  if (remotePinTokenInput) remotePinTokenInput.value = cfg.token || '';
+  remotePinSaveBtn.addEventListener('click', () => {
+    try {
+      localStorage.setItem(REMOTE_PIN_CFG_KEY, JSON.stringify({
+        endpoint: (remotePinEndpointInput?.value || '').trim(),
+        token: (remotePinTokenInput?.value || '').trim()
+      }));
+    } catch {}
+    setRemotePinStatus('Settings saved.');
+  });
+}
+if (remotePinBtn) {
+  remotePinBtn.addEventListener('click', remotePinRoot);
 }
 
 // Clone bar: copy the root CID, or fetch the whole repo and download a zip.
@@ -1504,29 +1709,190 @@ function getShareableMultiaddr() {
   return addrs[0] || null;
 }
 
+// Blocked peers: persisted denylist. Blocked peers are hung up on sight
+// (including inbound connections) and hidden from the connected list.
+const BLOCKED_KEY = 'blocked-peers';
+function getBlockedPeers() {
+  try { return JSON.parse(localStorage.getItem(BLOCKED_KEY) || '[]'); } catch { return []; }
+}
+function setBlockedPeers(list) {
+  try { localStorage.setItem(BLOCKED_KEY, JSON.stringify(list)); } catch {}
+}
+function isBlockedPeer(id) {
+  return getBlockedPeers().includes(id);
+}
+function blockPeer(id) {
+  if (!isBlockedPeer(id)) setBlockedPeers([...getBlockedPeers(), id]);
+  const pid = id;
+  heliaNode?.libp2p.hangUp(pid).catch(() => {});
+  refreshPeers();
+}
+function unblockPeer(id) {
+  setBlockedPeers(getBlockedPeers().filter((x) => x !== id));
+  refreshPeers();
+}
+
 function refreshPeers() {
   if (!heliaNode || !peersListEl) return;
   try {
     const peers = heliaNode.libp2p.getPeers();
+    const countEl = document.getElementById('peer-count');
+    if (countEl) countEl.textContent = String(peers.length);
+    peersListEl.innerHTML = '';
     if (!peers || peers.length === 0) {
       peersListEl.innerHTML = '<li>(none)</li>';
-      return;
     }
-    peersListEl.innerHTML = '';
+    const pingService = heliaNode.libp2p.services?.ping;
     for (const p of peers) {
+      const id = p.toString();
       const li = document.createElement('li');
-      li.textContent = p.toString();
-      li.style.fontSize = '0.85rem';
+      li.style.marginBottom = '0.4rem';
       li.style.wordBreak = 'break-all';
+      const fold = document.createElement('details');
+      const summary = document.createElement('summary');
+      summary.style.cursor = 'pointer';
+      summary.style.fontFamily = 'ui-monospace, SFMono-Regular, Menlo, monospace';
+      summary.style.fontSize = '0.8rem';
+      const idSpan = document.createElement('span');
+      idSpan.textContent = id;
+      idSpan.title = 'Click to copy peer ID';
+      idSpan.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        navigator.clipboard?.writeText(id);
+        idSpan.textContent = 'Copied to clipboard';
+        setTimeout(() => { idSpan.textContent = id; }, 900);
+      });
+      summary.appendChild(idSpan);
+      fold.appendChild(summary);
+
+      const body = document.createElement('div');
+      body.style.marginTop = '0.3rem';
+      body.style.paddingLeft = '1rem';
+
+      const btns = document.createElement('div');
+      btns.style.marginBottom = '0.3rem';
+      btns.style.whiteSpace = 'nowrap';
+      const mkBtn = (label, title, onClick) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'btn btn-sm';
+        b.textContent = label;
+        b.title = title;
+        b.style.marginRight = '0.35rem';
+        b.style.marginBottom = '0.1rem';
+        b.style.padding = '0.1rem 0.5rem';
+        b.style.fontSize = '0.75rem';
+        b.addEventListener('click', onClick);
+        return b;
+      };
+
+      const pingBtn = mkBtn('Ping', 'Measure round-trip latency', async () => {
+        if (!pingService) return;
+        pingBtn.disabled = true;
+        pingResult.textContent = 'pinging…';
+        try {
+          const latency = await pingService.ping(p);
+          pingResult.textContent = `ping: ${latency}ms`;
+        } catch (e) {
+          pingResult.textContent = `ping failed: ${(e?.message || e).slice(0, 40)}`;
+        } finally {
+          pingBtn.disabled = false;
+        }
+      });
+      if (!pingService) pingBtn.disabled = true;
+      const pingResult = document.createElement('span');
+      pingResult.style.marginLeft = '0.4rem';
+      pingResult.style.color = 'var(--color-fg-muted)';
+      pingResult.style.fontSize = '0.75rem';
+
+      btns.appendChild(pingBtn);
+      btns.appendChild(mkBtn('Disconnect', 'Drop all connections to this peer', () => {
+        heliaNode.libp2p.hangUp(p).catch(() => {});
+      }));
+      btns.appendChild(mkBtn('Block', 'Disconnect and refuse future connections (persisted)', () => {
+        blockPeer(id);
+      }));
+      body.appendChild(btns);
+      body.appendChild(pingResult);
+
+      try {
+        const conns = heliaNode.libp2p.getConnections(p);
+        const streams = conns.reduce((n, c) => n + (c.streams?.length || 0), 0);
+        const meta = document.createElement('div');
+        meta.style.color = 'var(--color-fg-muted)';
+        meta.style.fontSize = '0.75rem';
+        meta.textContent = `${conns.map((c) => c.direction).join(', ')} · ${conns.length} connection(s) · ${streams} stream(s)`;
+        body.appendChild(meta);
+        if (conns[0]) {
+          const addr = document.createElement('div');
+          addr.textContent = conns[0].remoteAddr.toString();
+          addr.style.cssText = 'color:var(--color-fg-muted);font-size:0.72rem;word-break:break-all;';
+          body.appendChild(addr);
+        }
+      } catch {}
+      fold.appendChild(body);
+      li.appendChild(fold);
       peersListEl.appendChild(li);
     }
+    renderBlockedPeers();
   } catch (e) {
     // ignore
   }
 }
 
+function renderBlockedPeers() {
+  const listEl = document.getElementById('blocked-peers-list');
+  const countEl = document.getElementById('blocked-count');
+  if (!listEl) return;
+  const blocked = getBlockedPeers();
+  if (countEl) countEl.textContent = String(blocked.length);
+  listEl.innerHTML = '';
+  if (blocked.length === 0) {
+    listEl.innerHTML = '<li>(none)</li>';
+    return;
+  }
+  for (const id of blocked) {
+    const li = document.createElement('li');
+    li.style.wordBreak = 'break-all';
+    li.style.marginBottom = '0.4rem';
+    const span = document.createElement('span');
+    span.textContent = id + ' ';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn btn-sm';
+    btn.textContent = 'Unblock';
+    btn.style.padding = '0.1rem 0.5rem';
+    btn.style.fontSize = '0.75rem';
+    btn.addEventListener('click', () => unblockPeer(id));
+    li.appendChild(span);
+    li.appendChild(btn);
+    listEl.appendChild(li);
+  }
+}
+
 if (copyMultiaddrBtn) {
   copyMultiaddrBtn.addEventListener('click', async () => {
+    // Contributors (design objective 2): peers providing the repo root,
+    // from the delegated routing provider records. Cached 5 min.
+    const root = cloneCidEl?.textContent.trim();
+    if (root && root.startsWith('baf')) {
+      const cacheKey = `gh-contributors-${root}`;
+      let cached = null;
+      try { cached = JSON.parse(localStorage.getItem(cacheKey) || 'null'); } catch {}
+      if (cached && Date.now() - cached.fetchedAt < 5 * 60 * 1000) {
+        renderContributors(cached.providers);
+      } else {
+        fetch(`https://delegated-ipfs.dev/routing/v1/providers/${root}`, { headers: { accept: 'application/json' } })
+          .then((r) => (r.ok ? r.json() : null))
+          .then((data) => {
+            const providers = (data?.Providers || []).map((p) => p.ID).filter(Boolean);
+            try { localStorage.setItem(cacheKey, JSON.stringify({ fetchedAt: Date.now(), providers })); } catch {}
+            renderContributors(providers);
+          })
+          .catch(() => {});
+      }
+    }
     const ma = getShareableMultiaddr();
     if (!ma) { shareStatus.textContent = 'No shareable address yet. Wait for a relay reservation.'; return; }
     try {
@@ -1620,6 +1986,35 @@ async function autoConnectFromUrl() {
   }
 }
 
+function renderContributors(providers) {
+  const el = document.getElementById('contributors-list');
+  if (!el) return;
+  el.innerHTML = '';
+  if (!providers || providers.length === 0) {
+    el.textContent = '(none yet — pin the repo on a Kubo to appear here)';
+    return;
+  }
+  for (const id of providers.slice(0, 8)) {
+    const div = document.createElement('div');
+    div.textContent = id;
+    div.title = 'Click to copy peer ID';
+    div.style.cssText = 'cursor:pointer;word-break:break-all;margin-bottom:0.25rem;';
+    div.addEventListener('click', () => {
+      navigator.clipboard?.writeText(id);
+      const orig = id;
+      div.textContent = 'Copied to clipboard';
+      setTimeout(() => { div.textContent = orig; }, 900);
+    });
+    el.appendChild(div);
+  }
+  if (providers.length > 8) {
+    const more = document.createElement('div');
+    more.style.color = 'var(--color-fg-muted)';
+    more.textContent = `+ ${providers.length - 8} more`;
+    el.appendChild(more);
+  }
+}
+
 // Color the "Connect to Bootstrap Peers" button from the live connect status:
 // green when connected, yellow while connecting/retrying, red otherwise.
 function updateBootstrapBtnState() {
@@ -1637,14 +2032,135 @@ function updateBootstrapBtnState() {
 updateBootstrapBtnState();
 
 // Periodically refresh peers + enable share buttons once a circuit address exists
+let lastCloneAnnounce = 0;
+const cloneRedialAttempts = new Map();
 setInterval(() => {
   refreshPeers();
   updateBootstrapBtnState();
+  // Keep the Node Status multiaddr list in sync: one foldable, copyable row
+  // per address. Rows appear once a relay reservation exists.
+  try {
+    if (multiaddrsListEl && heliaNode) {
+      const addrs = heliaNode.libp2p.getMultiaddrs().map((a) => a.toString());
+      const key = addrs.join('\n');
+      if (key !== multiaddrsListEl.dataset.key) {
+        multiaddrsListEl.dataset.key = key;
+        multiaddrsListEl.innerHTML = '';
+        if (addrs.length === 0) {
+          multiaddrsListEl.textContent = '(none yet — waiting for a relay reservation)';
+        } else {
+          for (const addr of addrs) {
+            const det = document.createElement('details');
+            det.style.marginBottom = '0.15rem';
+            const sum = document.createElement('summary');
+            sum.style.cssText = 'cursor:pointer;word-break:break-all;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.8rem;';
+            sum.textContent = addr;
+            sum.title = 'Click to copy';
+            const flash = () => {
+              const orig = addr;
+              sum.textContent = 'Copied to clipboard';
+              setTimeout(() => { sum.textContent = orig; }, 900);
+            };
+            sum.addEventListener('click', (e) => {
+              e.preventDefault();
+              navigator.clipboard?.writeText(addr).then(flash).catch(flash);
+            });
+            det.appendChild(sum);
+            const field = document.createElement('input');
+            field.type = 'text';
+            field.readOnly = true;
+            field.value = addr;
+            field.style.cssText = 'width:100%;margin:0.25rem 0 0.35rem 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.78rem;';
+            field.title = 'Click to select, then copy';
+            field.addEventListener('click', () => field.select());
+            field.addEventListener('focus', () => field.select());
+            det.appendChild(field);
+            multiaddrsListEl.appendChild(det);
+          }
+        }
+      }
+    }
+  } catch {}
+  const pubsub = heliaNode?.libp2p?.services?.pubsub;
+  if (pubsub) {
+    try {
+      const topic = `repo-gossip:${repoFullName}`;
+      const subs = pubsub.getSubscribers(topic).map(String);
+      const countEl = document.getElementById('clones-count');
+      const listEl = document.getElementById('clones-list');
+      if (countEl) countEl.textContent = String(subs.length);
+      if (listEl) {
+        listEl.innerHTML = '';
+        if (subs.length === 0) {
+          listEl.innerHTML = '<li>(none yet — open the page in another browser)</li>';
+        } else {
+          for (const id of subs) {
+            const li = document.createElement('li');
+            li.textContent = id;
+            li.style.wordBreak = 'break-all';
+            li.style.fontSize = '0.85rem';
+            listEl.appendChild(li);
+          }
+        }
+      }
+      // If nobody is known on the topic, re-announce: gossipsub only
+      // propagates subscriptions from subscribe events, so peers that
+      // connected after we subscribed never heard about us.
+      if (subs.length === 0 && Date.now() - lastCloneAnnounce > 15000) {
+        lastCloneAnnounce = Date.now();
+        try { pubsub.unsubscribe(topic); } catch {}
+        try { pubsub.subscribe(topic); } catch {}
+      }
+      // libp2p 2.x removed connection tagging, so protect clone peers
+      // app-side: redial any known subscriber we are no longer connected
+      // to (bounded: one attempt per peer per 20s).
+      for (const sub of subs) {
+        try {
+          const pid = sub;
+          if (heliaNode.libp2p.getConnections(pid).length === 0) {
+            const last = cloneRedialAttempts.get(pid) || 0;
+            if (Date.now() - last > 20000) {
+              cloneRedialAttempts.set(pid, Date.now());
+              heliaNode.libp2p.dial(pid).catch(() => {});
+            }
+          }
+        } catch {}
+      }
+    } catch {}
+  }
   const ma = getShareableMultiaddr();
+  // Branch pointer: one Copy-button binding, plus a republish every 10 min
+  // while the page is open so /ipns/<peerId> keeps resolving to the latest root.
+  const ipnsCopyBtn = document.getElementById('btn-code-copy-ipns');
+  if (ipnsCopyBtn && !ipnsCopyBtn.dataset.bound) {
+    ipnsCopyBtn.dataset.bound = '1';
+    ipnsCopyBtn.addEventListener('click', () => {
+      const fieldEl = document.getElementById('code-ipns-field');
+      const v = (fieldEl && (fieldEl.dataset.ipns || fieldEl.value)) || '';
+      if (!v) return;
+      const done = () => {
+        const orig = ipnsCopyBtn.textContent;
+        ipnsCopyBtn.textContent = 'Copied to clipboard';
+        setTimeout(() => { ipnsCopyBtn.textContent = orig; }, 900);
+      };
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        navigator.clipboard.writeText(v).then(done).catch(done);
+      } else {
+        done();
+      }
+    });
+  }
+  if (ipnsBranchCid && Date.now() - ipnsBranchLastPublish > 10 * 60 * 1000) {
+    publishBranchPointer(ipnsBranchCid).catch(() => {});
+  }
+  if (codeBtn && (ma || ipnsBranchName)) codeBtn.disabled = false;
+  if (remotePinBtn) {
+    const root = cloneCidEl?.textContent.trim() || '';
+    if (root.startsWith('baf') && loadRemotePinConfig().endpoint) remotePinBtn.disabled = false;
+  }
   if (ma) {
     if (copyMultiaddrBtn) copyMultiaddrBtn.disabled = false;
     if (copyLinkBtn) copyLinkBtn.disabled = false;
-    if (codeBtn) codeBtn.disabled = false;
     if (codeMultiaddrField && !codeMultiaddrField.value) codeMultiaddrField.value = ma;
     if (codeShareField && !codeShareField.value) codeShareField.value = buildShareLink() || '';
     if (shareLinkField && !shareLinkField.value) shareLinkField.value = buildShareLink() || '';
@@ -1727,6 +2243,21 @@ setInterval(() => {
         if (pubSub) {
           const url = `https://${published}.ipfs.dweb.link?filename=${slug}`;
           if (pubSub.textContent !== url) pubSub.textContent = url;
+        }
+        const tlPath = document.getElementById('publish-trustless-path-url');
+        if (tlPath) {
+          const url = `https://ipfs.io/ipfs/${published}?format=car`;
+          if (tlPath.textContent !== url) tlPath.textContent = url;
+        }
+        const tlSub = document.getElementById('publish-trustless-subdomain-url');
+        if (tlSub) {
+          const url = `https://${published}.ipfs.dweb.link?format=car`;
+          if (tlSub.textContent !== url) tlSub.textContent = url;
+        }
+        const tlCurl = document.getElementById('publish-trustless-curl-cmd');
+        if (tlCurl) {
+          const cmd = `curl -s "https://ipfs.io/ipfs/${published}?format=car" -o ${published}.car\nipfs dag import ${published}.car`;
+          if (tlCurl.textContent !== cmd) tlCurl.textContent = cmd;
         }
         const carImport = document.getElementById('publish-car-import-cmd');
         if (carImport) {

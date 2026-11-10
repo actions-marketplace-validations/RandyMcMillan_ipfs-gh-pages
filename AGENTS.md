@@ -38,8 +38,25 @@ and never bury a command inside a sentence.
 1. **This project enables devs to publish repos to IPFS — other people must
    be able to clone them.** Every feature is judged against that sentence.
 
-2. **Map the app's IPFS functionality to its related IPFS/libp2p
-   functionality.** Every feature the app provides has a canonical
-   counterpart in the IPFS ecosystem (a Kubo CLI command, a libp2p
-   mechanism, a spec). The app surfaces that mapping — the page is both a
-   tool and a reference for how IPFS works.
+2. **Map GitHub functionality to its IPFS/libp2p counterparts in the web
+   app.** The page replicates a GitHub repo view; for every GitHub concept
+   (clone, star, fork, watch, releases, raw view, README…) the app shows
+   the equivalent IPFS/libp2p mechanism — what it does today and what is
+   still a gap. The page is both a tool and a map of the decentralized
+   GitHub.
+
+# Release Procedure
+
+Releases are cut with:
+
+```
+npm run release <semver>
+```
+
+`scripts/release.mjs` bumps the version, rewrites README action references,
+commits, tags, and keeps the `actions-test` submodule in lockstep: it commits
+pending submodule changes, pushes its branch, tags it with the same release
+tag, and bumps the superproject gitlink. On every release it also pins
+`actions-test/.github/workflows/deploy.yml` to the release commit's full SHA
+so the fixture always consumes the release being cut. Do not cut a release
+unless the user asks for one; a commit is just a snapshot, not a release.
