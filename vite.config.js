@@ -4,6 +4,35 @@ import path from 'node:path';
 import { execSync } from 'node:child_process';
 
 function repoFilesPlugin() {
+  // Virtual submodule support
+  // -------------------------
+  // `git ls-files` lists a checked-out submodule as a single gitlink (a bare
+  // path with no content), which is why the app historically embedded nothing
+  // under e.g. actions-test/. This plugin instead runs `git ls-files --stage
+  // -z`, where gitlinks appear with mode 160000, and recurses into each with
+  // `git -C <path> ls-files -z` against the submodule's working tree. Every
+  // file found is emitted as "<submodule path>/<file>", so:
+  //
+  //   - the Files tab renders the submodule folder like any other tree,
+  //   - main.js feeds these entries to heliaUnixfs.addAll(), so the Clone
+  //     bar root CID — and Download CAR / `ipfs dag import` on Kubo — covers
+  //     the whole repository including submodule contents, and
+  //   - a consumer fork's build embeds whatever ITS submodule checkout
+  //     contains at that moment.
+  //
+  // Nothing is read from git object databases — only working-tree files.
+  // That is what makes the support "virtual": the IPFS tree mirrors the
+  // checkout, not the git history (no submodule SHA pinning in the DAG; a
+  // rebuild embeds whatever is currently checked out). An uninitialized
+  // submodule contributes zero entries instead of failing the build.
+  //
+  // Relationship to scripts/build-car.mjs: that script separately writes one
+  // <name>.car per submodule next to the main CAR. Those files are a
+  // transport convenience for `ipfs dag import`; they are NOT what the app
+  // embeds — the bundle's file set comes only from this plugin. Because
+  // `npm run build` runs vite before build-car, the bundle may carry the
+  // previous build's submodule .car file; the freshly written ones on disk
+  // (and in the Pages-deployed dist) are always current.
   const virtualId = 'virtual:repo-files';
   const resolvedId = '\0' + virtualId;
   return {
@@ -16,8 +45,26 @@ function repoFilesPlugin() {
       const root = process.env.REPO_ROOT ? path.resolve(process.env.REPO_ROOT) : process.cwd();
       let files = [];
       try {
-        const out = execSync('git ls-files -z', { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] });
-        files = out.toString('utf8').split('\0').filter(Boolean);
+        const stage = execSync('git ls-files --stage -z', { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] })
+          .toString('utf8').split('\0').filter(Boolean);
+        for (const rec of stage) {
+          const tab = rec.indexOf('\t');
+          const mode = rec.slice(0, tab).split(' ')[0];
+          const p = rec.slice(tab + 1);
+          if (mode === '160000') {
+            // Gitlink — a checked-out submodule. See the block comment above
+            // for how virtual submodule support works.
+            try {
+              const sub = execSync('git ls-files -z', { cwd: path.join(root, p), stdio: ['ignore', 'pipe', 'ignore'] })
+                .toString('utf8').split('\0').filter(Boolean);
+              for (const sf of sub) files.push(`${p}/${sf}`);
+            } catch {
+              // Uninitialized submodule — nothing on disk to embed.
+            }
+          } else {
+            files.push(p);
+          }
+        }
       } catch (e) {
         const walk = (dir) => {
           for (const name of fs.readdirSync(dir)) {
@@ -44,6 +91,29 @@ function repoFilesPlugin() {
   };
 }
 
+function resolveIdentity(root) {
+  let owner = process.env.GITHUB_REPOSITORY_OWNER || '';
+  let name = (process.env.GITHUB_REPOSITORY || '').split('/')[1] || '';
+  let version = process.env.npm_package_version || '';
+  if (!name || !version) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+      version = version || pkg.version || '';
+    } catch {}
+  }
+  if (!owner || !name) {
+    try {
+      const remote = execSync('git config --get remote.origin.url', { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+      const m = remote.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
+      if (m) {
+        owner = owner || m[1];
+        name = name || m[2];
+      }
+    } catch {}
+  }
+  return { owner: owner || 'gnostr', name: name || 'gnostr-repo', version };
+}
+
 function repoIdentityPlugin() {
   const virtualId = 'virtual:repo-identity';
   const resolvedId = '\0' + virtualId;
@@ -55,25 +125,7 @@ function repoIdentityPlugin() {
     load(id) {
       if (id !== resolvedId) return;
       const root = process.env.REPO_ROOT ? path.resolve(process.env.REPO_ROOT) : process.cwd();
-      let owner = process.env.GITHUB_REPOSITORY_OWNER || '';
-      let name = (process.env.GITHUB_REPOSITORY || '').split('/')[1] || '';
-      let version = process.env.npm_package_version || '';
-      if (!name || !version) {
-        try {
-          const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
-          version = version || pkg.version || '';
-        } catch {}
-      }
-      if (!owner || !name) {
-        try {
-          const remote = execSync('git config --get remote.origin.url', { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
-          const m = remote.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
-          if (m) {
-            owner = owner || m[1];
-            name = name || m[2];
-          }
-        } catch {}
-      }
+      const { owner, name, version } = resolveIdentity(root);
       let lastCommitMsg = '';
       let lastCommitTime = '';
       let shortSha = '';
@@ -86,6 +138,16 @@ function repoIdentityPlugin() {
         if (n > 1) commitCount = String(n);
       } catch {}
       return `export default { owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}, version: ${JSON.stringify(version)}, lastCommitMsg: ${JSON.stringify(lastCommitMsg)}, lastCommitTime: ${JSON.stringify(lastCommitTime)}, shortSha: ${JSON.stringify(shortSha)}, commitCount: ${JSON.stringify(commitCount)} };`;
+    },
+    transformIndexHtml(html) {
+      const root = process.env.REPO_ROOT ? path.resolve(process.env.REPO_ROOT) : process.cwd();
+      const { owner, name } = resolveIdentity(root);
+      // The template ships owner-neutral; the built page carries whoever's
+      // repo it is (GITHUB_REPOSITORY, else the git remote, else the gnostr
+      // fallback that main.js also uses at runtime).
+      return html
+        .replaceAll('__REPO_OWNER__', owner)
+        .replaceAll('__REPO_NAME__', name);
     }
   };
 }

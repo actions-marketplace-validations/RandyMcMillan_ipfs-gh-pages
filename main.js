@@ -4,8 +4,10 @@ import { createLibp2p } from 'libp2p';
 import { gossipsub } from '@chainsafe/libp2p-gossipsub';
 import { pubsubPeerDiscovery } from '@libp2p/pubsub-peer-discovery';
 import { ipns } from '@helia/ipns';
-import { generateKeyPair, privateKeyFromRaw } from '@libp2p/crypto/keys';
-import { peerIdFromPrivateKey } from '@libp2p/peer-id';
+import { generateKeyPair, privateKeyFromRaw, publicKeyFromProtobuf, publicKeyToProtobuf } from '@libp2p/crypto/keys';
+import { peerIdFromPrivateKey, peerIdFromPublicKey } from '@libp2p/peer-id';
+import * as dagJson from '@ipld/dag-json';
+import { sha256 } from 'multiformats/hashes/sha2';
 import { car } from '@helia/car';
 import { CarWriter } from '@ipld/car/writer';
 import repoIdentity from 'virtual:repo-identity';
@@ -53,6 +55,12 @@ function applyRepoIdentity() {
   document.querySelectorAll('a.gh-owner-link').forEach((a) => {
     a.href = `https://github.com/${repoOwner}`;
     a.textContent = repoOwner;
+  });
+  // The header avatar link wraps the owner image (no text to rewrite) and
+  // works for both user and organization owners — the .png shortcut
+  // redirects to the right avatar for either.
+  document.querySelectorAll('a.Header-link').forEach((a) => {
+    a.href = `https://github.com/${repoOwner}`;
   });
   document.querySelectorAll('a.gh-repo-link').forEach((a) => {
     a.href = repoUrl;
@@ -781,6 +789,146 @@ let ipnsBranchCid = null;
 let ipnsBranchLastPublish = 0;
 let ipnsBranchName = '';
 
+// Signed dag-json metadata (the GitHub "signed commit" equivalent): an
+// envelope {cid, name, timestamp, signer, signature, publicKey} stored as a
+// dag-json block. The signature covers the dag-json encoding of the first
+// five fields; verification re-encodes and checks with the embedded key.
+async function addDagJson(obj) {
+  const bytes = dagJson.encode(obj);
+  const cid = CID.create(1, dagJson.code, await sha256.digest(bytes));
+  await heliaNode.blockstore.put(cid, bytes);
+  return cid;
+}
+
+async function getDagJson(cid) {
+  const bytes = await heliaNode.blockstore.get(cid);
+  return dagJson.decode(bytes);
+}
+
+async function signPublished() {
+  const publishedEl = document.getElementById('output-cid');
+  const cid = publishedEl?.dataset.published ? publishedEl.textContent.trim() : null;
+  const resultEl = document.getElementById('signed-metadata-cid');
+  if (!cid) return;
+  if (resultEl) resultEl.textContent = 'Signing…';
+  try {
+    const key = await getIpnsBranchKey();
+    const signer = peerIdFromPrivateKey(key).toString();
+    const signed = {
+      cid,
+      name: window.__lastPublishedSlug || 'published',
+      timestamp: new Date().toISOString(),
+      signer
+    };
+    const signature = await key.sign(dagJson.encode(signed));
+    const envelope = {
+      ...signed,
+      signature: uint8ArrayToBase64(signature),
+      publicKey: uint8ArrayToBase64(publicKeyToProtobuf(key.publicKey))
+    };
+    const metaCid = await addDagJson(envelope);
+    heliaNode.routing?.provide?.(metaCid).catch(() => {});
+    if (resultEl) resultEl.textContent = metaCid.toString();
+  } catch (err) {
+    if (resultEl) resultEl.textContent = `Sign failed: ${err.message}`;
+  }
+}
+
+async function verifyMetadata() {
+  const input = document.getElementById('verify-metadata-cid');
+  const resultEl = document.getElementById('verify-metadata-result');
+  const raw = (input?.value || '').trim();
+  if (!resultEl) return;
+  if (!raw) {
+    resultEl.textContent = 'Paste a metadata CID first.';
+    return;
+  }
+  resultEl.textContent = 'Fetching…';
+  try {
+    const envelope = await getDagJson(CID.parse(raw));
+    const { signature, publicKey, ...signed } = envelope;
+    const payload = dagJson.encode(signed);
+    const pub = publicKeyFromProtobuf(base64ToUint8Array(publicKey));
+    const signer = peerIdFromPublicKey(pub).toString();
+    const ok = await pub.verify(payload, base64ToUint8Array(signature));
+    resultEl.textContent = ok
+      ? `✓ signed by ${signer}\n  payload ${signed.cid}\n  name ${signed.name}\n  at ${signed.timestamp}`
+      : `✗ signature INVALID (claims signer ${signer})`;
+  } catch (err) {
+    resultEl.textContent = `Verify failed: ${err.message}`;
+  }
+}
+
+// Repo chat (P9): signed dag-json envelopes over the repo gossip channel's
+// :chat subtopic — the GitHub discussions/watch-activity equivalent. Every
+// message is verified with the P7 envelope scheme; forgeries render marked.
+const chatSeen = new Set();
+
+async function renderChatMessage(data) {
+  const listEl = document.getElementById('chat-list');
+  if (!listEl) return;
+  let envelope;
+  try { envelope = dagJson.decode(data); } catch { return; }
+  const { signature, publicKey, ...signed } = envelope;
+  if (!signature || !publicKey || typeof signed.text !== 'string') return;
+  const key = `${signed.signer}:${signed.timestamp}:${signed.text.slice(0, 32)}`;
+  if (chatSeen.has(key)) return;
+  chatSeen.add(key);
+  let ok = false;
+  let signer = signed.signer;
+  try {
+    const pub = publicKeyFromProtobuf(base64ToUint8Array(publicKey));
+    signer = peerIdFromPublicKey(pub).toString();
+    ok = await pub.verify(dagJson.encode(signed), base64ToUint8Array(signature));
+  } catch {}
+  const li = document.createElement('li');
+  li.style.cssText = 'padding: 0.3rem 0; border-bottom: 1px solid var(--color-border-muted); word-break: break-word;';
+  const meta = document.createElement('div');
+  meta.className = 'f6';
+  meta.style.color = ok ? 'var(--color-fg-muted)' : 'var(--fgColor-danger, #cf222e)';
+  meta.textContent = `${ok ? '✓' : '✗ invalid signature'} ${signer} · ${signed.timestamp}`;
+  const body = document.createElement('div');
+  body.textContent = signed.text;
+  li.appendChild(meta);
+  li.appendChild(body);
+  if (listEl.querySelector('.color-fg-muted')) listEl.innerHTML = '';
+  listEl.prepend(li);
+  while (listEl.children.length > 50) listEl.removeChild(listEl.lastChild);
+}
+
+async function sendChatMessage() {
+  const input = document.getElementById('chat-input');
+  const text = (input?.value || '').trim();
+  if (!text) return;
+  const pubsub = heliaNode?.libp2p?.services?.pubsub;
+  if (!pubsub) return;
+  try {
+    const key = await getIpnsBranchKey();
+    const signer = peerIdFromPrivateKey(key).toString();
+    const signed = { text, timestamp: new Date().toISOString(), signer };
+    const signature = await key.sign(dagJson.encode(signed));
+    const envelope = {
+      ...signed,
+      signature: uint8ArrayToBase64(signature),
+      publicKey: uint8ArrayToBase64(publicKeyToProtobuf(key.publicKey))
+    };
+    const data = dagJson.encode(envelope);
+    await pubsub.publish(`repo-gossip:${repoFullName}:chat`, data);
+    if (input) input.value = '';
+    // emitSelf is off — render our own post so the sender sees it immediately.
+    await renderChatMessage(data);
+  } catch {}
+}
+
+const chatSendBtn = document.getElementById('btn-chat-send');
+if (chatSendBtn) chatSendBtn.addEventListener('click', sendChatMessage);
+const chatInput = document.getElementById('chat-input');
+if (chatInput) {
+  chatInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') sendChatMessage();
+  });
+}
+
 function getIpnsBranchKey() {
   if (!ipnsBranchKeyPromise) {
     ipnsBranchKeyPromise = (async () => {
@@ -802,6 +950,7 @@ function getIpnsBranchKey() {
 }
 
 async function publishBranchPointer(rootCid) {
+
   const field = document.getElementById('code-ipns-field');
   try {
     if (!heliaNode || !rootCid) return;
@@ -931,10 +1080,19 @@ async function initHelia() {
     // Clone detection: every instance of this app subscribes to a gossip
     // topic named after the repo, so subscribers ARE clones (peers running
     // the same published app). Unknown deployments share the gnostr default.
+    // The :chat subtopic carries signed repo chat between those same clones.
     const pubsub = heliaNode.libp2p.services?.pubsub;
     if (pubsub) {
       try {
         pubsub.subscribe(`repo-gossip:${repoFullName}`);
+      } catch {}
+      try {
+        const chatTopic = `repo-gossip:${repoFullName}:chat`;
+        pubsub.subscribe(chatTopic);
+        pubsub.addEventListener('message', (evt) => {
+          if (evt.detail.topic !== chatTopic) return;
+          renderChatMessage(evt.detail.data).catch(() => {});
+        });
       } catch {}
     }
 
@@ -1542,6 +1700,33 @@ if (remotePinSaveBtn) {
 if (remotePinBtn) {
   remotePinBtn.addEventListener('click', remotePinRoot);
 }
+const signPublishBtn = document.getElementById('btn-sign-publish');
+if (signPublishBtn) signPublishBtn.addEventListener('click', signPublished);
+const verifyMetadataBtn = document.getElementById('btn-verify-metadata');
+if (verifyMetadataBtn) verifyMetadataBtn.addEventListener('click', verifyMetadata);
+
+// Resolve the branch pointer the way a stranger would: through the IPNS
+// routers (local record, delegated routing, DHT) rather than our own state.
+async function checkIpnsResolution() {
+  const statusEl = document.getElementById('ipns-resolve-status');
+  if (!statusEl) return;
+  if (!heliaNode || !ipnsBranchName) {
+    statusEl.textContent = 'Publish the branch pointer first.';
+    return;
+  }
+  statusEl.textContent = 'Resolving…';
+  try {
+    const key = await getIpnsBranchKey();
+    const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('no answer within 30s')), 30000));
+    const res = await Promise.race([ipns(heliaNode).resolve(peerIdFromPrivateKey(key)), timeout]);
+    const path = res?.path?.toString?.() || res?.value?.toString?.() || String(res?.path ?? res?.value ?? '');
+    statusEl.textContent = `Resolves to ${path}`;
+  } catch (err) {
+    statusEl.textContent = `Not resolvable yet: ${err.message} — the record may still be propagating, or no router has it yet.`;
+  }
+}
+const ipnsResolveBtn = document.getElementById('btn-ipns-resolve');
+if (ipnsResolveBtn) ipnsResolveBtn.addEventListener('click', checkIpnsResolution);
 
 // Clone bar: copy the root CID, or fetch the whole repo and download a zip.
 if (cloneCidCopyBtn) {
@@ -2110,6 +2295,9 @@ setInterval(() => {
         lastCloneAnnounce = Date.now();
         try { pubsub.unsubscribe(topic); } catch {}
         try { pubsub.subscribe(topic); } catch {}
+        // Same propagation problem on the chat subtopic.
+        try { pubsub.unsubscribe(`${topic}:chat`); } catch {}
+        try { pubsub.subscribe(`${topic}:chat`); } catch {}
       }
       // libp2p 2.x removed connection tagging, so protect clone peers
       // app-side: redial any known subscriber we are no longer connected
@@ -2184,6 +2372,19 @@ setInterval(() => {
       if (root && root.startsWith('baf')) {
         const cmd = `ipfs pin add ${root}`;
         if (docPin.textContent !== cmd) docPin.textContent = cmd;
+      }
+    }
+    const docDnslinkIpns = document.getElementById('doc-dnslink-ipns');
+    if (docDnslinkIpns && ipnsBranchName) {
+      const rec = `dnslink=${ipnsBranchName}`;
+      if (docDnslinkIpns.textContent !== rec) docDnslinkIpns.textContent = rec;
+    }
+    const docDnslinkCid = document.getElementById('doc-dnslink-cid');
+    if (docDnslinkCid) {
+      const root = cloneCidEl?.textContent.trim();
+      if (root && root.startsWith('baf')) {
+        const rec = `dnslink=/ipfs/${root}`;
+        if (docDnslinkCid.textContent !== rec) docDnslinkCid.textContent = rec;
       }
     }
     const docPublish = document.getElementById('doc-publish-cmd');
