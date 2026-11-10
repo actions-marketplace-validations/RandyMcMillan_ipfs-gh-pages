@@ -1943,6 +1943,8 @@ function refreshPeers() {
     const peers = heliaNode.libp2p.getPeers();
     const countEl = document.getElementById('peer-count');
     if (countEl) countEl.textContent = String(peers.length);
+    const insightsPeers = document.getElementById('insights-peers');
+    if (insightsPeers) insightsPeers.textContent = String(peers.length);
     peersListEl.innerHTML = '';
     if (!peers || peers.length === 0) {
       peersListEl.innerHTML = '<li>(none)</li>';
@@ -2294,6 +2296,8 @@ setInterval(() => {
       const countEl = document.getElementById('clones-count');
       const listEl = document.getElementById('clones-list');
       if (countEl) countEl.textContent = String(subs.length);
+      const insightsClones = document.getElementById('insights-clones');
+      if (insightsClones) insightsClones.textContent = String(subs.length);
       if (listEl) {
         listEl.innerHTML = '';
         if (subs.length === 0) {
@@ -2749,22 +2753,352 @@ const hasShareLinkParam = (() => {
   return p.has('connect') || p.has('peer');
 })();
 
-// Tab navigation
+// Tab navigation — every named view has its own endpoint (#/code, #/issues,
+// #/peer, …) so a refresh or a shared link lands back on the same view.
+// GitHub-style PATH routes are accepted too: /code, /issues, /peer load the
+// right view and normalize to the canonical hash form. When both are given
+// (/code#/issues) the hash wins. Canonical form is the hash because GitHub
+// Pages has no SPA fallback for unknown paths — dist ships a 404.html copy
+// of index.html so deep path links on Pages still boot the app.
+const TAB_ROUTE_ALIAS = { code: 'files' };
+const ROUTE_NAMES = ['code', 'issues', 'pulls', 'actions', 'projects', 'wiki', 'security', 'insights', 'settings', 'peer', 'publish'];
+const VALID_TABS = ['files', 'issues', 'pulls', 'actions', 'projects', 'wiki', 'security', 'insights', 'settings', 'peer', 'publish'];
+
+function activateTab(tab) {
+  const target = TAB_ROUTE_ALIAS[tab] || tab;
+  if (!VALID_TABS.includes(target)) return false;
+  document.querySelectorAll('.tab-button[data-tab]').forEach((btn) => {
+    const on = btn.dataset.tab === target;
+    btn.classList.toggle('active', on);
+    btn.setAttribute('aria-selected', String(on));
+  });
+  document.querySelectorAll('.tab-panel').forEach((panel) => panel.classList.remove('active'));
+  const panel = document.getElementById(`tab-${target}`);
+  if (panel) panel.classList.add('active');
+  return true;
+}
+
+// The directory part of the current path with any route segment removed —
+// the shareable base (on Pages: /ipfs-gh-pages, locally: '' or '/').
+function basePath() {
+  const segs = window.location.pathname.replace(/\/+$/, '').split('/').filter(Boolean);
+  if (segs.length && ROUTE_NAMES.includes(segs[segs.length - 1])) segs.pop();
+  return segs.length ? '/' + segs.join('/') : '';
+}
+
+function applyRoute() {
+  const hashTab = window.location.hash.replace(/^#\/?/, '');
+  const lastSeg = window.location.pathname.replace(/\/+$/, '').split('/').filter(Boolean).pop() || '';
+  const tab = (hashTab && ROUTE_NAMES.includes(hashTab) && hashTab) || (ROUTE_NAMES.includes(lastSeg) && lastSeg) || '';
+  if (!tab) return;
+  activateTab(tab);
+  const canonical = `${basePath()}/#/${tab}`;
+  if (window.location.pathname + window.location.hash !== canonical) {
+    history.replaceState(null, '', canonical);
+  }
+}
+
 document.querySelectorAll('.tab-button[data-tab]').forEach((button) => {
   button.addEventListener('click', () => {
-    const tab = button.dataset.tab;
-    document.querySelectorAll('.tab-button[data-tab]').forEach((btn) => {
-      btn.classList.remove('active');
-      btn.setAttribute('aria-selected', 'false');
-    });
-    document.querySelectorAll('.tab-panel').forEach((panel) => {
-      panel.classList.remove('active');
-    });
-    button.classList.add('active');
-    button.setAttribute('aria-selected', 'true');
-    const panel = document.getElementById(`tab-${tab}`);
-    if (panel) panel.classList.add('active');
+    const route = button.dataset.tab === 'files' ? 'code' : button.dataset.tab;
+    if (`#/${route}` === window.location.hash) {
+      activateTab(route);
+    } else {
+      window.location.hash = `/${route}`;
+    }
   });
+});
+window.addEventListener('hashchange', applyRoute);
+applyRoute();
+
+// Settings endpoint deep-link: open the Peer tab's Settings sub-tab.
+const openNodeSettingsBtn = document.getElementById('btn-open-node-settings');
+if (openNodeSettingsBtn) {
+  openNodeSettingsBtn.addEventListener('click', () => {
+    window.location.hash = '/peer';
+    activateTab('peer');
+    const sub = document.getElementById('sub-tab-btn-settings');
+    if (sub) sub.click();
+  });
+}
+
+// Actions endpoint: show which build this page is.
+const actionsVersionEl = document.getElementById('actions-app-version');
+if (actionsVersionEl && appVersion) actionsVersionEl.textContent = `v${appVersion}`;
+
+// Issues and comments: signed dag-json note objects (docs/issues-car.md
+// phase 1 — the full note schema: ns/type/anchors, comments reply via
+// parent CID). signNote/verifyNote are shared by every note type.
+const ISSUES_KEY = 'repo-issues';
+const COMMENTS_KEY = 'repo-comments';
+
+function loadIssues() {
+  try { return JSON.parse(localStorage.getItem(ISSUES_KEY) || '[]'); } catch { return []; }
+}
+
+function loadCommentIndex() {
+  try { return JSON.parse(localStorage.getItem(COMMENTS_KEY) || '{}'); } catch { return {}; }
+}
+
+// Build the signed envelope for any note payload; signer identity is the
+// browser's Ed25519 key (same as IPNS/chat/attestation).
+async function signNote(fields) {
+  const key = await getIpnsBranchKey();
+  const signer = peerIdFromPrivateKey(key).toString();
+  const signed = { ...fields, signer };
+  const signature = await key.sign(dagJson.encode(signed));
+  return {
+    envelope: {
+      ...signed,
+      signature: uint8ArrayToBase64(signature),
+      publicKey: uint8ArrayToBase64(publicKeyToProtobuf(key.publicKey))
+    },
+    signer
+  };
+}
+
+// Verify a fetched note; returns { ok, signed, signer } without throwing on
+// a bad signature (that's data, not an error).
+async function verifyNote(envelope) {
+  const { signature, publicKey, ...signed } = envelope;
+  const pub = publicKeyFromProtobuf(base64ToUint8Array(publicKey));
+  const signer = peerIdFromPublicKey(pub).toString();
+  const ok = await pub.verify(dagJson.encode(signed), base64ToUint8Array(signature));
+  return { ok, signed, signer };
+}
+
+let currentIssueCid = null;
+
+function renderIssues() {
+  const listEl = document.getElementById('issues-list');
+  if (!listEl) return;
+  const issues = loadIssues();
+  listEl.innerHTML = '';
+  if (issues.length === 0) {
+    listEl.innerHTML = '<li class="f6 color-fg-muted">(none yet)</li>';
+    return;
+  }
+  for (const issue of issues) {
+    const li = document.createElement('li');
+    li.style.cssText = 'padding: 0.3rem 0; border-bottom: 1px solid var(--color-border-muted);';
+    const head = document.createElement('div');
+    head.style.cssText = 'display:flex; flex-wrap:wrap; gap: 0.5rem; align-items: baseline;';
+    const a = document.createElement('a');
+    a.href = '#';
+    a.textContent = issue.title || '(untitled)';
+    a.title = `Open and verify ${issue.cid}`;
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      openIssue(issue.cid);
+    });
+    const when = document.createElement('span');
+    when.className = 'f6 color-fg-muted';
+    when.textContent = issue.timestamp;
+    head.appendChild(a);
+    head.appendChild(when);
+    // Per-issue command, own line, yellow — the delegated design-pattern
+    // listener makes it single-click copy automatically.
+    const cmd = document.createElement('pre');
+    cmd.style.margin = '0.2rem 0 0.1rem 0';
+    const codeEl = document.createElement('code');
+    codeEl.textContent = `ipfs pin add ${issue.cid}`;
+    cmd.appendChild(codeEl);
+    li.appendChild(head);
+    li.appendChild(cmd);
+    listEl.appendChild(li);
+  }
+}
+
+async function publishNote(envelope) {
+  const cid = await addDagJson(envelope);
+  heliaNode.routing?.provide?.(cid).catch(() => {});
+  return cid.toString();
+}
+
+async function createIssue() {
+  const titleEl = document.getElementById('issue-title');
+  const bodyEl = document.getElementById('issue-body');
+  const statusEl = document.getElementById('issue-status');
+  const title = (titleEl?.value || '').trim();
+  const body = (bodyEl?.value || '').trim();
+  if (!title) {
+    if (statusEl) statusEl.textContent = 'Give the issue a title first.';
+    return;
+  }
+  if (!heliaNode) {
+    if (statusEl) statusEl.textContent = 'Wait for the node to come online.';
+    return;
+  }
+  if (statusEl) statusEl.textContent = 'Signing and publishing…';
+  try {
+    const { envelope, signer } = await signNote({
+      ns: 'issues',
+      type: 'issue',
+      anchors: [],
+      title,
+      body,
+      timestamp: new Date().toISOString()
+    });
+    const cid = await publishNote(envelope);
+    const issues = loadIssues();
+    issues.unshift({ cid, title, timestamp: envelope.timestamp, signer });
+    try { localStorage.setItem(ISSUES_KEY, JSON.stringify(issues)); } catch {}
+    if (titleEl) titleEl.value = '';
+    if (bodyEl) bodyEl.value = '';
+    if (statusEl) statusEl.textContent = `Created — ${cid}`;
+    // Hand the user the real command at the moment of creation, on its own
+    // line (yellow by the global command rule).
+    const resultPre = document.getElementById('issue-result');
+    if (resultPre) {
+      resultPre.style.display = 'block';
+      resultPre.querySelector('code').textContent = `ipfs pin add ${cid}`;
+    }
+    const pinCmd = document.getElementById('issue-pin-cmd');
+    if (pinCmd) pinCmd.textContent = `ipfs pin add ${cid}`;
+    renderIssues();
+  } catch (err) {
+    if (statusEl) statusEl.textContent = `Failed: ${err.message}`;
+  }
+}
+
+// A comment is a note whose parent is the issue (or another comment) —
+// the git-commit-parent analog; threads are chains, nothing is mutated.
+async function createComment(issueCid, body) {
+  const statusEl = document.getElementById('issue-reply-status');
+  if (!heliaNode) {
+    if (statusEl) statusEl.textContent = 'Wait for the node to come online.';
+    return;
+  }
+  if (statusEl) statusEl.textContent = 'Signing…';
+  try {
+    const { envelope } = await signNote({
+      ns: 'issues',
+      type: 'comment',
+      parent: issueCid,
+      body,
+      timestamp: new Date().toISOString()
+    });
+    const cid = await publishNote(envelope);
+    const index = loadCommentIndex();
+    (index[issueCid] = index[issueCid] || []).push(cid);
+    try { localStorage.setItem(COMMENTS_KEY, JSON.stringify(index)); } catch {}
+    const replyEl = document.getElementById('issue-reply');
+    if (replyEl) replyEl.value = '';
+    if (statusEl) statusEl.textContent = `Commented — ${cid}`;
+    openIssue(issueCid);
+  } catch (err) {
+    if (statusEl) statusEl.textContent = `Failed: ${err.message}`;
+  }
+}
+
+// Re-fetch by CID (bitswap if a stranger's node serves it) and verify the
+// signature before showing anything — the issue equivalent of "verify then
+// trust". Renders the thread into the detail panel.
+async function openIssue(cid) {
+  const statusEl = document.getElementById('issue-status');
+  const detailEl = document.getElementById('issue-detail');
+  const bodyEl = document.getElementById('issue-detail-body');
+  if (!statusEl || !heliaNode) return;
+  currentIssueCid = cid;
+  const pinCmd = document.getElementById('issue-pin-cmd');
+  if (pinCmd) pinCmd.textContent = `ipfs pin add ${cid}`;
+  statusEl.textContent = `Fetching ${cid}…`;
+  if (detailEl) detailEl.style.display = 'block';
+  if (bodyEl) bodyEl.innerHTML = '';
+  try {
+    const { ok, signed, signer } = await verifyNote(await getDagJson(CID.parse(cid)));
+    if (!ok) {
+      statusEl.textContent = `✗ signature INVALID for ${cid}`;
+      return;
+    }
+    statusEl.textContent = '';
+    if (bodyEl) {
+      const h = document.createElement('h4');
+      h.style.marginTop = '0';
+      h.textContent = signed.title || '(untitled)';
+      const meta = document.createElement('div');
+      meta.className = 'f6 color-fg-muted';
+      meta.style.wordBreak = 'break-all';
+      meta.textContent = `✓ ${signer} · ${signed.timestamp} · ${cid}`;
+      const body = document.createElement('p');
+      body.textContent = signed.body || '';
+      bodyEl.appendChild(h);
+      bodyEl.appendChild(meta);
+      if (signed.body) bodyEl.appendChild(body);
+    }
+    // Comment chain: fetch each locally-known comment CID, verify, render.
+    const commentCids = (loadCommentIndex()[cid] || []).slice().reverse();
+    for (const ccid of commentCids) {
+      try {
+        const c = await verifyNote(await getDagJson(CID.parse(ccid)));
+        const div = document.createElement('div');
+        div.style.cssText = 'margin-top: 0.5rem; padding-left: 0.75rem; border-left: 2px solid var(--color-border-muted);';
+        const cmeta = document.createElement('div');
+        cmeta.className = 'f6';
+        cmeta.style.color = c.ok ? 'var(--color-fg-muted)' : 'var(--fgColor-danger, #cf222e)';
+        cmeta.style.wordBreak = 'break-all';
+        cmeta.textContent = `${c.ok ? '✓' : '✗ invalid'} ${c.signer} · ${c.signed.timestamp}`;
+        const cbody = document.createElement('div');
+        cbody.textContent = c.signed.body || '';
+        div.appendChild(cmeta);
+        div.appendChild(cbody);
+        if (bodyEl) bodyEl.appendChild(div);
+      } catch {
+        const div = document.createElement('div');
+        div.className = 'f6 color-fg-muted';
+        div.textContent = `${ccid} — unavailable (no provider)`;
+        if (bodyEl) bodyEl.appendChild(div);
+      }
+    }
+    const index = loadCommentIndex();
+    if (bodyEl && (index[cid] || []).length === 0) {
+      const none = document.createElement('div');
+      none.className = 'f6 color-fg-muted';
+      none.style.marginTop = '0.5rem';
+      none.textContent = '(no comments yet — comments from other browsers arrive with the index, phase 4)';
+      bodyEl.appendChild(none);
+    }
+  } catch (err) {
+    statusEl.textContent = `Fetch failed: ${err.message} — no provider online? Pin the CID or keep a tab open.`;
+  }
+}
+
+const issueCreateBtn = document.getElementById('btn-issue-create');
+if (issueCreateBtn) issueCreateBtn.addEventListener('click', createIssue);
+const issueReplyBtn = document.getElementById('btn-issue-reply');
+if (issueReplyBtn) {
+  issueReplyBtn.addEventListener('click', () => {
+    const replyEl = document.getElementById('issue-reply');
+    const body = (replyEl?.value || '').trim();
+    if (!body || !currentIssueCid) return;
+    createComment(currentIssueCid, body);
+  });
+}
+renderIssues();
+
+// DESIGN IDIOM — single-click copy (keep this pattern; see the matching
+// block in index.html's CSS): EVERY command displayed anywhere on the page
+// copies with one click, and the WHOLE surrounding box is the target — any
+// <pre><code> block or kubo chip, current or added later, is covered by
+// this one delegated listener. The inner code element flashes confirmation
+// so styling and live updates (real CIDs, never placeholders) survive.
+document.addEventListener('click', (e) => {
+  const el = e.target.closest('pre:has(> code), code.kubo-chip');
+  if (!el) return;
+  const v = el.textContent.trim();
+  if (!v || v.includes('Copied to clipboard')) return;
+  const flashTarget = el.tagName === 'PRE' ? (el.querySelector('code') || el) : el;
+  if (!el.title) el.title = 'Click to copy';
+  const done = () => {
+    const orig = flashTarget.textContent;
+    flashTarget.textContent = 'Copied to clipboard';
+    setTimeout(() => { if (flashTarget.textContent === 'Copied to clipboard') flashTarget.textContent = orig; }, 900);
+  };
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    navigator.clipboard.writeText(v).then(done).catch(done);
+  } else {
+    done();
+  }
 });
 
 // Sub-tab navigation (inside Peer tab)
