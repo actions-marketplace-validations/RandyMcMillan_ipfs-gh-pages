@@ -117,6 +117,56 @@ await evalJson(`document.getElementById('blob-repo-link').click(); true`);
 await new Promise((r) => setTimeout(r, 300));
 check('repo link returns to the tree', await evalJson(`document.getElementById('blob-view').hidden && !document.getElementById('tree-view').hidden`));
 
+// Every top-level tab is an endpoint link; pressing Code while a file
+// view is open escapes to the tree (same-route click re-applies #/code).
+vlog('Checking tab endpoint links + Code escape...');
+check('all top-level tabs are endpoint links', await evalJson(`(() => {
+  const routes = ['code', 'issues', 'pulls', 'actions', 'projects', 'wiki', 'security', 'insights', 'settings', 'peer', 'publish'];
+  return routes.every((r) => document.querySelector(\`a.tab-link[href="#/\${r}"][data-tab-route="\${r}"]\`));
+})()`));
+await evalJson(`(() => {
+  const rows = [...document.querySelectorAll('#file-tree li.row')];
+  const f = rows.find((x) => x.querySelector('.cell-name span').textContent === 'package.json');
+  if (f) f.querySelector('.cell-name').click();
+  return Boolean(f);
+})()`);
+await new Promise((r) => setTimeout(r, 400));
+check('blob view open before Code press', await evalJson(`!document.getElementById('blob-view').hidden`));
+await evalJson(`document.querySelector('a.tab-link[data-tab-route="code"]').click(); true`);
+await new Promise((r) => setTimeout(r, 300));
+check('Code tab press escapes the file view to the tree', await evalJson(`document.getElementById('blob-view').hidden && !document.getElementById('tree-view').hidden && document.getElementById('tab-files').classList.contains('active')`));
+
+// Breadcrumb segments link to their place in the tree: open
+// assets/repo-head.txt, click the "assets" segment, land on that folder.
+vlog('Checking breadcrumb segment links...');
+await evalJson(`(() => {
+  const rows = [...document.querySelectorAll('#file-tree li.row')];
+  const dir = rows.find((x) => x.querySelector('.cell-name span').textContent === 'assets');
+  if (dir) dir.querySelector('.cell-name').click();
+  return Boolean(dir);
+})()`);
+await new Promise((r) => setTimeout(r, 300));
+await evalJson(`(() => {
+  const rows = [...document.querySelectorAll('#file-tree li.row')];
+  const f = rows.find((x) => x.querySelector('.cell-name span').textContent === 'repo-head.txt');
+  if (f) f.querySelector('.cell-name').click();
+  return Boolean(f);
+})()`);
+await new Promise((r) => setTimeout(r, 400));
+check('blob opens for assets/repo-head.txt', await evalJson(`!document.getElementById('blob-view').hidden`));
+check('breadcrumb renders a link for the assets directory', await evalJson(`[...document.querySelectorAll('#blob-path a')].some((a) => a.textContent.trim() === '/ assets')`));
+await evalJson(`(() => {
+  const a = [...document.querySelectorAll('#blob-path a')].find((x) => x.textContent.trim() === '/ assets');
+  if (a) a.click();
+  return Boolean(a);
+})()`);
+await new Promise((r) => setTimeout(r, 400));
+check('clicking the assets segment returns to the tree at that folder', await evalJson(`(() => {
+  if (!document.getElementById('blob-view').hidden) return false;
+  const row = [...document.querySelectorAll('#file-tree li.row')].find((x) => x.dataset.path === 'assets');
+  return Boolean(row) && row.getBoundingClientRect().height > 0;
+})()`));
+
 // Commit bar carries real build-time data.
 vlog('Checking the commit bar...');
 const commitMsg = await evalJson(`document.getElementById('commit-msg').textContent`);
@@ -130,6 +180,12 @@ vlog('Checking metadata wiring...');
 await new Promise((r) => setTimeout(r, 3000));
 check('star counter wired', (await evalJson(`document.getElementById('gh-star-count')?.textContent`)) !== undefined);
 check('language bar wired', (await evalJson(`document.querySelectorAll('#lang-bar span').length`)) >= 1);
+// Branch count is a live value, never hardcoded (any-repo plugin): when
+// the API answers, the element shows "N Branch(es)"; offline it stays the
+// neutral "Branches" fallback — never a fake count.
+const branchesText = await evalJson(`document.getElementById('gh-branches-count')?.textContent || ''`);
+check('branches count is a live value or neutral fallback',
+  /^(\d+ Branch(es)?|Branches)$/.test(branchesText.trim()), branchesText);
 
 // Objective-2 mapping: reference table and Kubo chips render with live values.
 vlog('Checking IPFS ↔ Kubo mapping...');

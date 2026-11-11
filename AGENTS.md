@@ -45,7 +45,9 @@ superproject. Verify before any superproject push:
 node scripts/check-gitlink.mjs
 ```
 
-Enforced by: `.githooks/pre-push` (blocks default-branch pushes on an
+Enforced by: `.githooks/pre-commit` (BLOCKS recording a gitlink bump
+while the submodule commit is still unpushed — the state must never be
+created), `.githooks/pre-push` (blocks default-branch pushes on an
 unresolvable gitlink), `scripts/release.mjs` (runs the guard before
 pushing main), and the CI workflows (guard step before submodule checkout,
 so a violation fails with a clear message instead of a cryptic one).
@@ -75,7 +77,11 @@ Page-wide patterns. Keep them; new UI gets them for free or not at all.
   `<pre><code>` in any panel inherits all three.
 - **Live values**: if the page knows the real CID/hash/address, print it —
   never a placeholder when the data exists (pattern: `doc-pin-cmd`,
-  `chip-car-export`, `issue-pin-cmd`).
+  `chip-car-export`, `issue-pin-cmd`). Repo metadata (branch/tag counts,
+  stars, forks) is always fetched per-repo at runtime — this app is a
+  plugin for ANY GitHub repo, so no repo-specific value may be hardcoded;
+  when the API is unreachable, fall back to a neutral label, never a fake
+  number.
 - **Full values**: never truncate CIDs, hashes, peer IDs, URLs for display;
   let the UI wrap (user override: gitlink markers in the file tree use
   GitHub's `@<short>` convention next to the folder name).
@@ -93,7 +99,7 @@ commits, tags, and keeps the `actions-test` submodule in lockstep: it commits
 pending submodule changes, pushes its branch, tags it with the same release
 tag, and bumps the superproject gitlink. The fixture's
 `actions-test/.github/workflows/deploy.yml` stays in lockstep with the repo's
-`example.deploy.yml`: `scripts/install-example-deploy.mjs` installs one as
+`consumer.example.yml`: `scripts/install-consumer-example.mjs` installs one as
 the other on every release AND before every CAR build (it is wired into the
 build script), so the fixture always consumes the release being cut — the
 workflow auto-detects the newest `v*` tag, which is that release once the

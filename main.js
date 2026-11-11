@@ -23,6 +23,7 @@ import { formatSize, base64ToUint8Array, uint8ArrayToBase64, buildRepoTree, isBr
 import { classifyIndexSync } from './js/index-merge.js';
 import { normalizeLineRange, makeLineCommentFields, isLineCommentNote, commentsByLine } from './js/line-comments.js';
 import { collectReleases, blameLines, blameCommentMatches } from './js/blame.js';
+import { findCidTokens, cidAffordanceModel } from './js/cid-links.js';
 
 // Repo identity: prefer the Pages origin (<owner>.github.io/<repo>), then the
 // build-time identity baked by the action (GITHUB_REPOSITORY / git remote), so
@@ -43,16 +44,22 @@ const repoFullName = `${repoOwner}/${repoName}`;
 const repoUrl = `https://github.com/${repoFullName}`;
 const pagesUrl = `https://${repoOwner}.github.io/${repoName}/`;
 const appVersion = repoIdentity.version || '';
+// The header "latest release" chip shows the repo's latest TAG (baked at
+// build time from the checkout — consumer workflows need fetch-depth: 0,
+// see example.deploy.yml); appVersion (the action's version) is the
+// fallback and stays the Actions panel's "Built as v…".
+const tagVersion = repoIdentity.tagVersion || '';
 
 function applyRepoIdentity() {
   document.title = repoFullName;
   const search = document.getElementById('repo-search-input');
   if (search) search.value = repoFullName;
-  if (appVersion) {
+  const releaseVersion = tagVersion || appVersion;
+  if (releaseVersion) {
     const rel = document.getElementById('latest-release-version');
-    if (rel) rel.textContent = `v${appVersion}`;
+    if (rel) rel.textContent = `v${releaseVersion}`;
     const relLink = document.getElementById('latest-release-link');
-    if (relLink) relLink.dataset.ghpath = `/releases/tag/v${appVersion}`;
+    if (relLink) relLink.dataset.ghpath = `/releases/tag/v${releaseVersion}`;
   }
   document.querySelectorAll('a.gh-link').forEach((a) => {
     a.href = repoUrl + (a.dataset.ghpath || '');
@@ -150,14 +157,37 @@ async function refreshRepoMetadata() {
   }
   try {
     const headers = { accept: 'application/vnd.github+json' };
-    const [repoRes, langRes] = await Promise.all([
+    const [repoRes, langRes, branchRes, relRes] = await Promise.all([
       fetch(`https://api.github.com/repos/${repoFullName}`, { headers }),
-      fetch(`https://api.github.com/repos/${repoFullName}/languages`, { headers })
+      fetch(`https://api.github.com/repos/${repoFullName}/languages`, { headers }),
+      // Exact branch count in one tiny request: per_page=1 + the Link
+      // header's last page (no Link → the array itself is 0 or 1).
+      fetch(`https://api.github.com/repos/${repoFullName}/branches?per_page=1`, { headers }),
+      fetch(`https://api.github.com/repos/${repoFullName}/releases/latest`, { headers })
     ]);
     if (!repoRes.ok) return;
     const repo = await repoRes.json();
     const languages = langRes.ok ? await langRes.json() : null;
-    const meta = { fetchedAt: Date.now(), repo, languages };
+    let branches = null;
+    if (branchRes.ok) {
+      const link = branchRes.headers.get('link');
+      const last = link && link.match(/[?&]page=(\d+)>;\s*rel="last"/);
+      branches = last ? parseInt(last[1], 10) : (await branchRes.json()).length;
+    }
+    // Latest release, else newest tag (repos without releases still show
+    // their real tag — the agregore v1.5.0-vs-v2.24.0 bug).
+    let release = null;
+    if (relRes.ok) {
+      const r = await relRes.json();
+      if (r.tag_name) release = { tag: r.tag_name, url: r.html_url };
+    } else {
+      const tagsRes = await fetch(`https://api.github.com/repos/${repoFullName}/tags?per_page=1`, { headers });
+      if (tagsRes.ok) {
+        const tags = await tagsRes.json();
+        if (tags.length) release = { tag: tags[0].name, url: `https://github.com/${repoFullName}/releases/tag/${tags[0].name}` };
+      }
+    }
+    const meta = { fetchedAt: Date.now(), repo, languages, branches, release };
     try { localStorage.setItem(cacheKey, JSON.stringify(meta)); } catch (e) {}
     applyRepoMetadata(meta);
   } catch (e) {
@@ -174,6 +204,21 @@ function applyRepoMetadata(meta) {
   setCount('gh-watch-count', repo.subscribers_count);
   setCount('gh-fork-count', repo.forks_count);
   setCount('gh-star-count', repo.stargazers_count);
+  if (typeof meta.branches === 'number') {
+    const el = document.getElementById('gh-branches-count');
+    if (el) el.textContent = `${meta.branches} Branch${meta.branches === 1 ? '' : 'es'}`;
+  }
+  // Live release/tag beats the build-time bake (which only refreshes when
+  // the site rebuilds; the API answer is always current).
+  if (meta.release && meta.release.tag) {
+    const rel = document.getElementById('latest-release-version');
+    if (rel) rel.textContent = meta.release.tag;
+    const relLink = document.getElementById('latest-release-link');
+    if (relLink) {
+      relLink.dataset.ghpath = `/releases/tag/${meta.release.tag}`;
+      relLink.href = meta.release.url;
+    }
+  }
 
   if (repo.description) {
     const desc = document.getElementById('about-description');
@@ -484,6 +529,28 @@ let blobCurrentBytes = null;
 let blobCurrentCid = null;
 let blobCurrentPath = null;
 
+// Expand the repo tree to a directory: reveal every ancestor nested list
+// so the target row is visible, then scroll to it and flash it. Folded
+// chains (".github/workflows" as one row) match by prefix.
+function expandTreeTo(dirPath) {
+  if (!fileTreeEl) return;
+  const rows = [...fileTreeEl.querySelectorAll('li.row[data-path]')];
+  const target = rows.find((li) => li.dataset.path === dirPath)
+    || rows.find((li) => li.dataset.path.startsWith(dirPath + '/'));
+  if (!target) return;
+  let el = target;
+  while (el && el !== fileTreeEl) {
+    if (el.classList && el.classList.contains('nested')) el.hidden = false;
+    el = el.parentElement;
+  }
+  target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  const nameEl = target.querySelector('.cell-name');
+  if (nameEl) {
+    nameEl.style.backgroundColor = 'var(--color-accent-subtle)';
+    setTimeout(() => { nameEl.style.backgroundColor = ''; }, 1200);
+  }
+}
+
 function showFileBlob(path) {
   const b64 = repoFiles[path];
   if (!b64 || !blobView || !treeView) return;
@@ -496,8 +563,29 @@ function showFileBlob(path) {
   const repoLink = document.getElementById('blob-repo-link');
   repoLink.textContent = repoName;
   const pathEl = document.getElementById('blob-path');
-  const dir = path.split('/').slice(0, -1).join('/');
-  pathEl.textContent = dir ? ` / ${dir} / ${path.split('/').pop()}` : ` / ${path.split('/').pop()}`;
+  // Breadcrumb: every directory segment links to its place in the tree
+  // (GitHub-style); the file name stays plain text.
+  pathEl.innerHTML = '';
+  const parts = path.split('/');
+  parts.forEach((part, i) => {
+    const isFile = i === parts.length - 1;
+    const segPath = parts.slice(0, i + 1).join('/');
+    if (isFile) {
+      const span = document.createElement('span');
+      span.textContent = ` / ${part}`;
+      pathEl.appendChild(span);
+      return;
+    }
+    const a = document.createElement('a');
+    a.href = '#/code'; // the tree endpoint; the click also expands the folder
+    a.textContent = ` / ${part}`;
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      hideFileBlob();
+      expandTreeTo(segPath);
+    });
+    pathEl.appendChild(a);
+  });
   document.getElementById('blob-meta').textContent = `${formatSize(bytes.length)}`;
 
   const codeEl = document.getElementById('blob-code');
@@ -1140,6 +1228,7 @@ function renderRepoTable(nodes, depth = 0) {
   for (const node of sorted) {
     const li = document.createElement('li');
     li.className = 'row';
+    li.dataset.path = node.path;
 
     const cells = document.createElement('div');
     cells.className = 'cells';
@@ -2222,33 +2311,38 @@ if (codeMultiaddrField) {
   codeMultiaddrField.addEventListener('focus', () => codeMultiaddrField.select());
 }
 
-// Remote pin (Pinning Services API) — the GitHub "star" equivalent: pin the
-// repo root CID to a remote pinning service so it outlives this tab. Config
-// persists in localStorage only; the request follows the PSA spec.
+// Remote pin (Pinning Services API) — the GitHub "star" equivalent: pin a
+// CID to a remote pinning service so it outlives this tab. Shared by the
+// repo-root button and the CID popover; config persists in localStorage
+// only, the request follows the PSA spec.
+async function remotePinCid(cid, name) {
+  const cfg = loadRemotePinConfig();
+  if (!cfg.endpoint || !cfg.token) {
+    throw new Error('Set the endpoint + token first (Code tab, ☆ Remote pin settings).');
+  }
+  const origins = [];
+  const ma = getShareableMultiaddr();
+  if (ma) origins.push(ma);
+  const res = await fetch(cfg.endpoint, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${cfg.token}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ cid, name, origins })
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`);
+  return res.json();
+}
+
 async function remotePinRoot() {
   const root = cloneCidEl?.textContent.trim();
-  const cfg = loadRemotePinConfig();
   if (!root || !root.startsWith('baf')) return;
-  if (!cfg.endpoint || !cfg.token) {
-    setRemotePinStatus('Set the endpoint + token below first.');
-    return;
-  }
   setRemotePinStatus('Pinning…');
   remotePinBtn.disabled = true;
   try {
-    const origins = [];
-    const ma = getShareableMultiaddr();
-    if (ma) origins.push(ma);
-    const res = await fetch(cfg.endpoint, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${cfg.token}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ cid: root, name: repoFullName, origins })
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`);
-    const pin = await res.json();
+    const pin = await remotePinCid(root, repoFullName);
+    const cfg = loadRemotePinConfig();
     try {
       localStorage.setItem(REMOTE_PIN_LAST_KEY, JSON.stringify({ requestId: pin.requestId, cid: root, endpoint: cfg.endpoint, status: pin.status }));
     } catch {}
@@ -2290,6 +2384,17 @@ if (remotePinSaveBtn) {
       }));
     } catch {}
     setRemotePinStatus('Settings saved.');
+  });
+}
+// Pinata preset: fills the PSA endpoint (docs.pinata.cloud — the page's
+// remotePinCid speaks the Pinning Services API JSON, same call the
+// server-side SDK's upload.public.cid wraps).
+const remotePinPresetPinata = document.getElementById('btn-remote-pin-preset-pinata');
+if (remotePinPresetPinata) {
+  remotePinPresetPinata.addEventListener('click', () => {
+    if (remotePinEndpointInput) remotePinEndpointInput.value = 'https://api.pinata.cloud/psa/pins';
+    if (remotePinTokenInput) remotePinTokenInput.focus();
+    setRemotePinStatus('Endpoint set to Pinata — paste your JWT and Save.');
   });
 }
 if (remotePinBtn) {
@@ -3342,14 +3447,21 @@ const VALID_TABS = ['files', 'issues', 'pulls', 'actions', 'projects', 'wiki', '
 function activateTab(tab) {
   const target = TAB_ROUTE_ALIAS[tab] || tab;
   if (!VALID_TABS.includes(target)) return false;
-  document.querySelectorAll('.tab-button[data-tab]').forEach((btn) => {
-    const on = btn.dataset.tab === target;
-    btn.classList.toggle('active', on);
-    btn.setAttribute('aria-selected', String(on));
+  // Nav items are endpoint links (`<a href="#/route" data-tab-route>`);
+  // match active state by route, not by tab name.
+  const route = target === 'files' ? 'code' : target;
+  document.querySelectorAll('.tab-button[data-tab], a.tab-link[data-tab-route]').forEach((el) => {
+    const elRoute = el.dataset.tabRoute || (el.dataset.tab === 'files' ? 'code' : el.dataset.tab);
+    const on = elRoute === route;
+    el.classList.toggle('active', on);
+    el.setAttribute('aria-selected', String(on));
   });
   document.querySelectorAll('.tab-panel').forEach((panel) => panel.classList.remove('active'));
   const panel = document.getElementById(`tab-${target}`);
   if (panel) panel.classList.add('active');
+  // The Code tab's landing state is the file tree — arriving at #/code
+  // (link click or navigation) escapes any open file view.
+  if (target === 'files') hideFileBlob();
   return true;
 }
 
@@ -3373,14 +3485,12 @@ function applyRoute() {
   }
 }
 
-document.querySelectorAll('.tab-button[data-tab]').forEach((button) => {
-  button.addEventListener('click', () => {
-    const route = button.dataset.tab === 'files' ? 'code' : button.dataset.tab;
-    if (`#/${route}` === window.location.hash) {
-      activateTab(route);
-    } else {
-      window.location.hash = `/${route}`;
-    }
+// Tab links navigate natively (hash → applyRoute). Clicking the CURRENT
+// route's link fires no hashchange, so re-apply it: pressing Code while a
+// file view is open escapes to the tree.
+document.querySelectorAll('a.tab-link[data-tab-route]').forEach((a) => {
+  a.addEventListener('click', () => {
+    if (a.getAttribute('href') === window.location.hash) applyRoute();
   });
 });
 window.addEventListener('hashchange', applyRoute);
@@ -3399,11 +3509,29 @@ function openUri(uri) {
   return true;
 }
 
+// Companion preference (docs/ipfs-uri-providers.md §1.3): with companion
+// (or the iOS build) present, native ipfs:// hrefs are the better path —
+// skip interception so the extension handles them. Default off:
+// interception wins because it works with no install.
+const COMPANION_PREF_KEY = 'pref-ipfs-companion';
+function companionPrefOn() {
+  try { return localStorage.getItem(COMPANION_PREF_KEY) === '1'; } catch { return false; }
+}
+const companionToggle = document.getElementById('pref-companion');
+if (companionToggle) {
+  companionToggle.checked = companionPrefOn();
+  companionToggle.addEventListener('change', () => {
+    try { localStorage.setItem(COMPANION_PREF_KEY, companionToggle.checked ? '1' : '0'); } catch {}
+  });
+}
+
 document.addEventListener('click', (e) => {
   const a = e.target.closest && e.target.closest('a[href^="ipfs://"],a[href^="ipns://"],a[href^="web+ipfs://"],a[href^="web+ipns://"]');
   if (!a) return;
+  const href = a.getAttribute('href');
+  if (companionPrefOn() && /^(?:ipfs|ipns):\/\//i.test(href)) return; // native passthrough
   e.preventDefault();
-  openUri(a.getAttribute('href'));
+  openUri(href);
 });
 
 try {
@@ -3413,6 +3541,207 @@ try {
 
 const uriParam = new URLSearchParams(window.location.search).get('uri');
 if (uriParam) openUri(uriParam);
+
+// ---- CID linkification (docs/ipfs-uri-providers.md step 3) ----------------
+// Every CID rendered anywhere on the page becomes a link — click fetches
+// in-app through our own Helia node (the ipfs:// interception above) and
+// opens the affordance popover below. Commands stay plain: pre blocks and
+// kubo chips are copy targets (design idiom), so they are never linkified.
+const LINKIFY_SKIP = 'pre, .kubo-chip, a, script, style, textarea, input, select, [contenteditable], #cid-popover';
+
+function linkifyTextNode(node) {
+  const text = node.nodeValue;
+  if (!text || !/(?:baf|bag|Qm)/.test(text)) return;
+  const tokens = findCidTokens(text);
+  if (tokens.length === 0) return;
+  const frag = document.createDocumentFragment();
+  let last = 0;
+  for (const t of tokens) {
+    if (t.start > last) frag.appendChild(document.createTextNode(text.slice(last, t.start)));
+    const a = document.createElement('a');
+    a.href = `ipfs://${t.cid}`;
+    a.className = 'cid-link';
+    a.textContent = t.cid;
+    frag.appendChild(a);
+    last = t.end;
+  }
+  if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+  node.parentNode.replaceChild(frag, node);
+}
+
+function linkifyCids(root) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node.nodeValue || !node.parentElement) return NodeFilter.FILTER_REJECT;
+      if (node.parentElement.closest(LINKIFY_SKIP)) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+  const targets = [];
+  while (walker.nextNode()) targets.push(walker.currentNode);
+  for (const n of targets) linkifyTextNode(n);
+}
+
+// One observer covers every current and future CID: re-renders that
+// replace text nodes are picked up automatically. Wrapping converges —
+// new links live inside <a>, which the walker skips.
+const cidLinkObserver = new MutationObserver((mutations) => {
+  const elements = [];
+  const texts = [];
+  for (const m of mutations) {
+    if (m.type === 'childList') {
+      for (const n of m.addedNodes) {
+        if (n.nodeType === Node.ELEMENT_NODE) elements.push(n);
+        else if (n.nodeType === Node.TEXT_NODE) texts.push(n);
+      }
+    } else if (m.type === 'characterData') {
+      texts.push(m.target);
+    }
+  }
+  for (const n of texts) {
+    if (n.parentElement && !n.parentElement.closest(LINKIFY_SKIP)) linkifyTextNode(n);
+  }
+  const visible = elements.filter((el) => !el.closest(LINKIFY_SKIP));
+  if (visible.length) {
+    requestAnimationFrame(() => { for (const el of visible) linkifyCids(el); });
+  }
+});
+cidLinkObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+linkifyCids(document.body);
+
+// ---- CID affordance popover (docs/ipfs-uri-providers.md §2 + step 3) ------
+// gateway / ipfs:// / providers / pin affordances for any linkified CID.
+let cidPopover = null;
+
+function closeCidPopover() {
+  if (cidPopover) { cidPopover.remove(); cidPopover = null; }
+}
+
+async function loadProvidersInto(el, cid) {
+  try {
+    const res = await fetch(`${DELEGATED_ROUTING_URL}/routing/v1/providers/${cid}`, {
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const providers = (await res.json()).Providers || [];
+    el.innerHTML = '';
+    const head = document.createElement('div');
+    head.textContent = `${providers.length} provider(s) (delegated routing)`;
+    el.appendChild(head);
+    for (const p of providers.slice(0, 5)) {
+      const id = document.createElement('div');
+      id.style.wordBreak = 'break-all';
+      id.textContent = p.ID;
+      el.appendChild(id);
+      for (const addr of (p.Addrs || []).slice(0, 3)) {
+        const pre = document.createElement('pre');
+        pre.style.margin = '0.15rem 0';
+        const code = document.createElement('code');
+        code.textContent = `ipfs swarm connect '${addr}'`;
+        pre.appendChild(code);
+        el.appendChild(pre);
+      }
+    }
+    if (providers.length === 0) {
+      el.textContent = '0 providers found (delegated routing) — gateways may still resolve it.';
+    }
+  } catch (err) {
+    el.textContent = `Provider lookup failed: ${err.message}`;
+  }
+}
+
+function showCidPopover(cid, anchor) {
+  closeCidPopover();
+  const model = cidAffordanceModel(cid);
+  const pop = document.createElement('div');
+  pop.id = 'cid-popover';
+  pop.style.cssText = 'position:fixed;z-index:1000;max-width:min(30rem,90vw);background:var(--color-canvas-overlay,#ffffff);color:var(--color-fg-default,#1f2328);border:1px solid var(--color-border-default,#d0d7de);border-radius:6px;padding:0.6rem 0.75rem;font-size:0.8rem;box-shadow:0 8px 24px rgba(0,0,0,0.12);';
+
+  const head = document.createElement('div');
+  head.style.cssText = 'font-weight:600;word-break:break-all;margin-bottom:0.35rem;';
+  head.textContent = cid;
+  pop.appendChild(head);
+
+  const linkRow = (label, href, external) => {
+    const div = document.createElement('div');
+    div.style.cssText = 'word-break:break-all;margin:0.1rem 0;';
+    const a = document.createElement('a');
+    a.href = href;
+    a.textContent = label;
+    if (external) {
+      a.target = '_blank';
+      a.rel = 'noopener';
+    }
+    div.appendChild(a);
+    pop.appendChild(div);
+  };
+  linkRow(model.ipfsUri, model.ipfsUri, false);
+  linkRow(model.gatewayUrl, model.gatewayUrl, true);
+  linkRow(model.subdomainUrl, model.subdomainUrl, true);
+
+  const pre = document.createElement('pre');
+  pre.style.margin = '0.35rem 0';
+  const code = document.createElement('code');
+  code.textContent = model.pinCmd;
+  pre.appendChild(code);
+  pop.appendChild(pre);
+
+  const prov = document.createElement('div');
+  prov.className = 'f6 color-fg-muted';
+  prov.style.marginTop = '0.35rem';
+  prov.textContent = 'Looking up providers (delegated routing)…';
+  pop.appendChild(prov);
+
+  const pinRow = document.createElement('div');
+  pinRow.style.cssText = 'margin-top:0.4rem;display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;';
+  const pinBtn = document.createElement('button');
+  pinBtn.className = 'btn btn-sm';
+  pinBtn.type = 'button';
+  pinBtn.textContent = '☆ Pin to provider';
+  const pinStatus = document.createElement('span');
+  pinStatus.className = 'f6 color-fg-muted';
+  pinStatus.style.wordBreak = 'break-all';
+  pinRow.appendChild(pinBtn);
+  pinRow.appendChild(pinStatus);
+  pop.appendChild(pinRow);
+
+  pinBtn.addEventListener('click', async () => {
+    pinBtn.disabled = true;
+    pinStatus.textContent = 'Pinning…';
+    try {
+      const pin = await remotePinCid(cid, repoFullName);
+      pinStatus.textContent = `Pin ${pin.status}${pin.requestId ? ` (${pin.requestId})` : ''}`;
+    } catch (err) {
+      pinStatus.textContent = `Pin failed: ${err.message}`;
+      pinBtn.disabled = false;
+    }
+  });
+
+  document.body.appendChild(pop);
+  const r = anchor.getBoundingClientRect();
+  const pw = pop.offsetWidth;
+  const ph = pop.offsetHeight;
+  const left = Math.min(Math.max(8, r.left), window.innerWidth - pw - 8);
+  let top = r.bottom + 8;
+  if (top + ph > window.innerHeight - 8) top = Math.max(8, r.top - ph - 8);
+  pop.style.left = `${left}px`;
+  pop.style.top = `${top}px`;
+  cidPopover = pop;
+  loadProvidersInto(prov, cid);
+}
+
+document.addEventListener('click', (e) => {
+  const link = e.target.closest && e.target.closest('a.cid-link');
+  if (link) {
+    showCidPopover(link.getAttribute('href').replace(/^ipfs:\/\//, ''), link);
+    return; // the ipfs:// interception above runs the in-app fetch
+  }
+  if (cidPopover && !e.target.closest('#cid-popover')) closeCidPopover();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeCidPopover();
+});
 
 // Settings endpoint deep-link: open the Peer tab's Settings sub-tab.
 const openNodeSettingsBtn = document.getElementById('btn-open-node-settings');
