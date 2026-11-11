@@ -1,0 +1,855 @@
+use ratzilla::ratatui::{
+    layout::{Constraint, Layout, Rect},
+    style::{Color, Modifier, Style},
+    symbols,
+    text::{self, Span},
+    widgets::{
+        canvas::{self, Canvas, Circle, Map, MapResolution, Rectangle},
+        Axis, BarChart, Block, Cell, Chart, Dataset, Gauge, LineGauge, List, ListItem, Paragraph,
+        Row, Sparkline, Table, Tabs, Wrap,
+    },
+    Frame,
+};
+use tachyonfx::Duration;
+// use tui_big_text::{BigText, PixelSize};
+
+use crate::app::App;
+
+pub fn draw(elapsed: Duration, frame: &mut Frame, app: &mut App) {
+    let show_cmd_bar = app.cmd_open || !app.cmd_output.is_empty();
+    let chunks = if show_cmd_bar {
+        Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(frame.area())
+    } else {
+        Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(frame.area())
+    };
+    let tabs = app
+        .tabs
+        .titles
+        .iter()
+        .map(|t| text::Line::from(Span::styled(*t, Style::default().fg(Color::LightGreen))))
+        .collect::<Tabs>()
+        .block(Block::bordered().title(app.title))
+        .highlight_style(Style::default().fg(Color::LightYellow))
+        .select(app.tabs.index);
+    frame.render_widget(tabs, chunks[0]);
+    match app.tabs.index {
+        0 => draw_first_tab(frame, app, chunks[1]),
+        1 => draw_about_tab(frame, chunks[1]),
+        2 => draw_second_tab(frame, app, chunks[1]),
+        3 => draw_third_tab(frame, app, chunks[1]),
+        4 => draw_ipfs_tab(frame, app, chunks[1]),
+        5 => draw_peers_tab(frame, app, chunks[1]),
+        6 => draw_fetch_tab(frame, app, chunks[1]),
+        7 => draw_publish_tab(frame, app, chunks[1]),
+        8 => draw_chat_tab(frame, app, chunks[1]),
+        9 => draw_kubo_tab(frame, app, chunks[1]),
+        10 => draw_services_tab(frame, app, chunks[1]),
+        11 => draw_git_tab(frame, app, chunks[1]),
+        12 => draw_repo_tab(frame, app, chunks[1]),
+        13 => draw_issues_tab(frame, app, chunks[1]),
+        _ => {}
+    };
+    // let big_text = BigText::builder()
+    //     .pixel_size(PixelSize::Quadrant)
+    //     .lines(vec!["RATZILLA".white().into()])
+    //     .build();
+    // frame.render_widget(
+    //     big_text,
+    //     frame.area().inner(Margin {
+    //         horizontal: frame.area().width / 2 - 15,
+    //         vertical: 0,
+    //     }),
+    // );
+    let area = frame.area();
+    app.effects
+        .process_effects(elapsed, frame.buffer_mut(), area);
+
+    if show_cmd_bar {
+        let bar = if app.cmd_open {
+            format!(":{}_", app.cmd_buffer)
+        } else {
+            // Last result, one line; the full value stays available via the
+            // tab outputs for structured results.
+            let trimmed = app.cmd_output.trim();
+            let flat: String = trimmed.chars().filter(|c| *c != '\n').collect();
+            flat
+        };
+        let rect = if chunks.len() > 2 { chunks[2] } else { area };
+        frame.render_widget(
+            Paragraph::new(bar).style(Style::default().fg(Color::LightGreen)),
+            rect,
+        );
+    }
+}
+
+fn draw_first_tab(frame: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::vertical([
+        Constraint::Length(9),
+        Constraint::Min(8),
+        Constraint::Length(7),
+    ])
+    .split(area);
+    draw_gauges(frame, app, chunks[0]);
+    draw_charts(frame, app, chunks[1]);
+    draw_text(frame, chunks[2]);
+}
+
+fn draw_peers_tab(frame: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
+    let snap = &app.ipfs;
+    let mut lines = vec![];
+    if snap.connections.is_empty() {
+        lines.push(text::Line::from(
+            "(no connections — press c to dial a multiaddr)",
+        ));
+    } else {
+        for conn in &snap.connections {
+            lines.push(text::Line::from(format!(
+                "{} [{}] {}",
+                conn.peer, conn.direction, conn.addr
+            )));
+        }
+    }
+    let block = Block::bordered().title(format!("Peers ({} connected)", snap.connections.len()));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+    let footer = if app.input_active {
+        format!(
+            "connect: > {}_   (Enter dials, Esc cancels)",
+            app.input_buffer
+        )
+    } else if app.last_result.is_empty() {
+        "c = connect".to_string()
+    } else {
+        app.last_result.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        chunks[1],
+    );
+}
+
+fn draw_issues_tab(frame: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
+    let issues = &app.ipfs.issues;
+    let mut lines = vec![];
+    if issues.is_empty() {
+        lines.push(text::Line::from(
+            "(no issues — press i to file one; s syncs from the index IPNS name)",
+        ));
+    } else {
+        for issue in issues {
+            lines.push(text::Line::from(format!(
+                "{} {} {}",
+                issue.timestamp, issue.title, issue.cid
+            )));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(format!("Issues ({} in view)", issues.len())))
+            .wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+    let footer = if app.input_active {
+        format!(
+            "file issue: > {}_   (Enter files, Esc cancels)",
+            app.input_buffer
+        )
+    } else if !app.last_result.is_empty() {
+        app.last_result.clone()
+    } else {
+        "i = file issue   s = sync from IPNS".to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        chunks[1],
+    );
+}
+
+fn draw_repo_tab(frame: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
+    let body = if app.repo_output.is_empty() {
+        "(repo not published — press p to add the whole repo tree to IPFS and advertise it)"
+    } else {
+        app.repo_output.as_str()
+    };
+    frame.render_widget(
+        Paragraph::new(body)
+            .block(Block::bordered().title("Repo"))
+            .wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+    let footer = if app.input_active {
+        format!("> {}_", app.input_buffer)
+    } else if app.last_result.is_empty() {
+        "p = publish repo tree to IPFS".to_string()
+    } else {
+        app.last_result.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        chunks[1],
+    );
+}
+
+fn draw_git_tab(frame: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
+    let snap = &app.ipfs;
+    let mut lines = vec![
+        text::Line::from(
+            "Clone a repo through the app: fetch a bare-repo-shaped CID tree, get a zip with .git/ reconstructed.",
+        ),
+        text::Line::from(
+            "Live clone: s = isomorphic-git clone (persists in-browser)   u = pull newer CID   l = list clones",
+        ),
+        text::Line::from(""),
+        text::Line::from(format!(
+            "Serve advertisements seen: {}{}",
+            snap.git_seen,
+            if snap.serving { " (we are advertising)" } else { "" }
+        )),
+    ];
+    if !app.last_result.is_empty() {
+        lines.push(text::Line::from(""));
+        lines.push(text::Line::from(app.last_result.as_str()));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title("Git"))
+            .wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+    let footer = if app.input_active {
+        match app.input_target {
+            crate::app::InputTarget::GitClone => {
+                format!(
+                    "clone CID: > {}_   (Enter clones to zip, Esc cancels)",
+                    app.input_buffer
+                )
+            }
+            crate::app::InputTarget::GitCloneSmart => {
+                format!(
+                    "live clone CID: > {}_   (Enter clones in-browser, Esc cancels)",
+                    app.input_buffer
+                )
+            }
+            crate::app::InputTarget::GitPullSmart => {
+                format!(
+                    "pull CID: > {}_   (Enter pulls newer state, Esc cancels)",
+                    app.input_buffer
+                )
+            }
+            _ => format!(
+                "advertise CID: > {}_   (Enter publishes serve envelope, Esc cancels)",
+                app.input_buffer
+            ),
+        }
+    } else {
+        "c = clone zip   s = live clone   u = pull   a = advertise   l = list clones".to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        chunks[1],
+    );
+}
+
+fn draw_services_tab(frame: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
+    let names = &app.ipfs.service_names;
+    let mut lines = vec![
+        text::Line::from(
+            "Optional service endpoints (docs/optional-services.md) — the p2p path works with none configured.",
+        ),
+        text::Line::from(""),
+    ];
+    if names.is_empty() {
+        lines.push(text::Line::from(
+            "(none configured — public defaults in use)",
+        ));
+    } else {
+        for name in names {
+            lines.push(text::Line::from(format!("• {name}")));
+        }
+    }
+    if !app.last_result.is_empty() {
+        lines.push(text::Line::from(""));
+        lines.push(text::Line::from(app.last_result.as_str()));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title("Services"))
+            .wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+    let footer = if app.input_active {
+        format!(
+            "set services JSON array: > {}_   (Enter applies, Esc cancels)",
+            app.input_buffer
+        )
+    } else {
+        "s = set services (paste a JSON array, e.g. [{\"name\":\"gnostr.org\",\"gateways\":[...]}])"
+            .to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        chunks[1],
+    );
+}
+
+fn draw_kubo_tab(frame: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
+    let kubo = &app.ipfs;
+    let mut lines = vec![
+        text::Line::from(format!("Status: {}", kubo.kubo_status)),
+        text::Line::from(format!("Endpoint: {}", kubo.kubo_endpoint)),
+        text::Line::from(format!("Peer ID: {}", kubo.kubo_peer_id)),
+    ];
+    if !app.last_result.is_empty() {
+        lines.push(text::Line::from(""));
+        lines.push(text::Line::from(app.last_result.as_str()));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title("Kubo"))
+            .wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+    let footer = if app.input_active {
+        match app.input_target {
+            crate::app::InputTarget::KuboRpc => {
+                format!("rpc: > {}_   (Enter calls, Esc cancels)", app.input_buffer)
+            }
+            _ => format!(
+                "pin CID: > {}_   (Enter pins, Esc cancels)",
+                app.input_buffer
+            ),
+        }
+    } else {
+        "d = detect   p = pin CID   k = any RPC (e.g. \"pin/ls\", \"swarm/peers\", \"repo/stat\")"
+            .to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        chunks[1],
+    );
+}
+
+fn draw_chat_tab(frame: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
+    let inbox = &app.ipfs.chat_inbox;
+    let mut lines = vec![];
+    if inbox.is_empty() {
+        lines.push(text::Line::from("(no messages — press m to send one)"));
+    } else {
+        for msg in inbox.iter().rev() {
+            // Oldest first so the newest sits at the bottom.
+            let mark = if msg.verified { "✓" } else { "✗" };
+            lines.push(text::Line::from(format!(
+                "{} {} {}: {}",
+                mark, msg.timestamp, msg.signer, msg.text
+            )));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(format!("Chat ({} message(s))", inbox.len())))
+            .wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+    let footer = if app.input_active {
+        format!("chat: > {}_   (Enter sends, Esc cancels)", app.input_buffer)
+    } else if app.last_result.is_empty() {
+        "m = send message".to_string()
+    } else {
+        app.last_result.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        chunks[1],
+    );
+}
+
+fn draw_publish_tab(frame: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
+    let body = if app.publish_output.is_empty() {
+        "(nothing published — press p and enter text)"
+    } else {
+        app.publish_output.as_str()
+    };
+    frame.render_widget(
+        Paragraph::new(body)
+            .block(Block::bordered().title("Publish"))
+            .wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+    let footer = if app.input_active {
+        format!(
+            "publish text: > {}_   (Enter publishes, Esc cancels)",
+            app.input_buffer
+        )
+    } else if app.last_result.is_empty() {
+        "p = publish text".to_string()
+    } else {
+        app.last_result.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        chunks[1],
+    );
+}
+
+fn draw_fetch_tab(frame: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
+    let body = if app.fetch_output.is_empty() {
+        "(no content fetched — press f and enter a CID)"
+    } else {
+        app.fetch_output.as_str()
+    };
+    frame.render_widget(
+        Paragraph::new(body)
+            .block(Block::bordered().title("Fetch"))
+            .wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+    let footer = if app.input_active {
+        format!(
+            "fetch CID: > {}_   (Enter fetches, Esc cancels)",
+            app.input_buffer
+        )
+    } else if app.last_result.is_empty() {
+        "f = fetch CID".to_string()
+    } else {
+        app.last_result.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        chunks[1],
+    );
+}
+
+fn draw_ipfs_tab(frame: &mut Frame, app: &mut App, area: Rect) {
+    let snap = &app.ipfs;
+    let mut lines = vec![
+        text::Line::from(format!("Status: {}", snap.node_status)),
+        text::Line::from(format!("Peer ID: {}", snap.peer_id)),
+        text::Line::from(format!("Connections: {}", snap.connections.len())),
+        text::Line::from(format!(
+            "Kubo: {}{}",
+            snap.kubo_status,
+            if snap.kubo_endpoint.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", snap.kubo_endpoint)
+            }
+        )),
+        text::Line::from(format!(
+            "Git serve adverts seen: {}{}",
+            snap.git_seen,
+            if snap.serving { " (serving)" } else { "" }
+        )),
+        text::Line::from(""),
+        text::Line::from("Multiaddrs:"),
+    ];
+    if snap.multiaddrs.is_empty() {
+        lines.push(text::Line::from("(none - browser node)"));
+    } else {
+        for addr in &snap.multiaddrs {
+            lines.push(text::Line::from(addr.as_str()));
+        }
+    }
+    let block = Block::bordered().title("IPFS");
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_about_tab(frame: &mut Frame, area: Rect) {
+    let block = Block::bordered().title("About");
+    let text = vec![
+        text::Line::from("ipfs-gh-pages — a Ratzilla (ratatui in the browser) TUI bundled as a"),
+        text::Line::from("native desktop app by wry, alongside a Helia IPFS node."),
+        text::Line::from(""),
+        text::Line::from(
+            "The IPFS node (Helia, in the page) dials bootstrap.libp2p.io on start and",
+        ),
+        text::Line::from("joins the repo-gossip:ipfs-gh-pages gossipsub topic so clones discover"),
+        text::Line::from("each other. Its live status is the footer bar on the left:"),
+        text::Line::from("IPFS: peer <id> — N connection(s)."),
+        text::Line::from(""),
+        text::Line::from("In devtools, window.__heliaNode is the running node."),
+        text::Line::from(""),
+        text::Line::from("Keys: Left/Right switch tabs, Up/Down move the task list, t toggles"),
+        text::Line::from("the chart, q sets the quit flag. Footer right side shows FPS; the"),
+        text::Line::from("backend switcher (?backend=dom|canvas|webgl2) is hidden, not removed."),
+        text::Line::from(""),
+        text::Line::from("Repo: https://github.com/RandyMcMillan/ipfs-gh-pages"),
+        text::Line::from("Build: scripts/bundle.sh --build | serve: scripts/bundle.sh --run"),
+    ];
+    let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_gauges(frame: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(3),
+        Constraint::Length(2),
+    ])
+    .margin(1)
+    .split(area);
+    let block = Block::bordered().title("Graphs");
+    frame.render_widget(block, area);
+
+    let label = format!("{:.2}%", app.progress * 100.0);
+    let gauge = Gauge::default()
+        .block(Block::new().title("Gauge:"))
+        .gauge_style(
+            Style::default()
+                .fg(Color::LightMagenta)
+                .bg(Color::Black)
+                .add_modifier(Modifier::ITALIC | Modifier::BOLD),
+        )
+        .use_unicode(app.enhanced_graphics)
+        .label(label)
+        .ratio(app.progress);
+    frame.render_widget(gauge, chunks[0]);
+
+    let sparkline = Sparkline::default()
+        .block(Block::new().title("Sparkline:"))
+        .style(Style::default().fg(Color::LightGreen))
+        .data(&app.sparkline.points)
+        .bar_set(if app.enhanced_graphics {
+            symbols::bar::NINE_LEVELS
+        } else {
+            symbols::bar::THREE_LEVELS
+        });
+    frame.render_widget(sparkline, chunks[1]);
+
+    let line_gauge = LineGauge::default()
+        .block(Block::new().title("LineGauge:"))
+        .filled_style(Style::default().fg(Color::LightMagenta))
+        .filled_symbol(if app.enhanced_graphics {
+            symbols::line::THICK.horizontal
+        } else {
+            symbols::line::NORMAL.horizontal
+        })
+        .ratio(app.progress);
+    frame.render_widget(line_gauge, chunks[2]);
+}
+
+#[allow(clippy::too_many_lines)]
+fn draw_charts(frame: &mut Frame, app: &mut App, area: Rect) {
+    let constraints = if app.show_chart {
+        vec![Constraint::Percentage(50), Constraint::Percentage(50)]
+    } else {
+        vec![Constraint::Percentage(100)]
+    };
+    let chunks = Layout::horizontal(constraints).split(area);
+    {
+        let chunks = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(chunks[0]);
+        {
+            let chunks =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(chunks[0]);
+
+            // Draw tasks
+            let tasks: Vec<ListItem> = app
+                .tasks
+                .items
+                .iter()
+                .map(|i| ListItem::new(vec![text::Line::from(Span::raw(*i))]))
+                .collect();
+            let tasks = List::new(tasks)
+                .block(Block::bordered().title("List"))
+                .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+                .highlight_symbol("> ");
+            frame.render_stateful_widget(tasks, chunks[0], &mut app.tasks.state);
+
+            // Draw logs
+            let info_style = Style::default().fg(Color::Green);
+            let warning_style = Style::default().fg(Color::LightYellow);
+            let error_style = Style::default().fg(Color::LightMagenta);
+            let critical_style = Style::default().fg(Color::LightRed);
+            let logs: Vec<ListItem> = app
+                .logs
+                .items
+                .iter()
+                .map(|&(evt, level)| {
+                    let s = match level {
+                        "ERROR" => error_style,
+                        "CRITICAL" => critical_style,
+                        "WARNING" => warning_style,
+                        _ => info_style,
+                    };
+                    let content = vec![text::Line::from(vec![
+                        Span::styled(format!("{level:<9}"), s),
+                        Span::raw(evt),
+                    ])];
+                    ListItem::new(content)
+                })
+                .collect();
+            let logs = List::new(logs).block(Block::bordered().title("List"));
+            frame.render_stateful_widget(logs, chunks[1], &mut app.logs.state);
+        }
+
+        let barchart = BarChart::default()
+            .block(Block::bordered().title("Bar Chart"))
+            .data(&app.barchart)
+            .bar_width(3)
+            .bar_gap(2)
+            .bar_set(if app.enhanced_graphics {
+                symbols::bar::NINE_LEVELS
+            } else {
+                symbols::bar::THREE_LEVELS
+            })
+            .value_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::LightGreen)
+                    .add_modifier(Modifier::ITALIC),
+            )
+            .label_style(Style::default().fg(Color::Yellow))
+            .bar_style(Style::default().fg(Color::LightGreen));
+        frame.render_widget(barchart, chunks[1]);
+    }
+    if app.show_chart {
+        let x_labels = vec![
+            Span::styled(
+                format!("{}", app.signals.window[0]),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "{}",
+                (app.signals.window[0] + app.signals.window[1]) / 2.0
+            )),
+            Span::styled(
+                format!("{}", app.signals.window[1]),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ];
+        let datasets = vec![
+            Dataset::default()
+                .name("data2")
+                .marker(symbols::Marker::Dot)
+                .style(Style::default().fg(Color::White))
+                .data(&app.signals.sin1.points),
+            Dataset::default()
+                .name("data3")
+                .marker(if app.enhanced_graphics {
+                    symbols::Marker::Braille
+                } else {
+                    symbols::Marker::Dot
+                })
+                .style(Style::default().fg(Color::LightCyan))
+                .data(&app.signals.sin2.points),
+        ];
+        let chart = Chart::new(datasets)
+            .block(
+                Block::bordered().title(Span::styled(
+                    "Chart",
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+            )
+            .x_axis(
+                Axis::default()
+                    .title("X Axis")
+                    .style(Style::default().fg(Color::Gray))
+                    .bounds(app.signals.window)
+                    .labels(x_labels),
+            )
+            .y_axis(
+                Axis::default()
+                    .title("Y Axis")
+                    .style(Style::default().fg(Color::Gray))
+                    .bounds([-20.0, 20.0])
+                    .labels([
+                        Span::styled("-20", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw("0"),
+                        Span::styled("20", Style::default().add_modifier(Modifier::BOLD)),
+                    ]),
+            );
+        frame.render_widget(chart, chunks[1]);
+    }
+}
+
+fn draw_text(frame: &mut Frame, area: Rect) {
+    let text = vec![
+        text::Line::from("This is a paragraph with several lines. You can change style your text the way you want"),
+        text::Line::from(""),
+        text::Line::from(vec![
+            Span::from("For example: "),
+            Span::styled("under", Style::default().fg(Color::LightRed)),
+            Span::raw(" "),
+            Span::styled("the", Style::default().fg(Color::LightGreen)),
+            Span::raw(" "),
+            Span::styled("rainbow", Style::default().fg(Color::LightCyan)),
+            Span::raw("."),
+        ]),
+        text::Line::from(vec![
+            Span::raw("Oh and if you didn't "),
+            Span::styled("notice", Style::default().add_modifier(Modifier::ITALIC)),
+            Span::raw(" you can "),
+            Span::styled("automatically", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+            Span::styled("wrap", Style::default().add_modifier(Modifier::REVERSED)),
+            Span::raw(" your "),
+            Span::styled("text", Style::default().add_modifier(Modifier::UNDERLINED)),
+            Span::raw(".")
+        ]),
+        text::Line::from(
+            "One more thing is that it should display unicode characters: 10€"
+        ),
+    ];
+    let block = Block::bordered().title(Span::styled(
+        "Footer",
+        Style::default()
+            .fg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_second_tab(frame: &mut Frame, app: &mut App, area: Rect) {
+    let chunks =
+        Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)]).split(area);
+    let up_style = Style::default().fg(Color::LightGreen);
+    let failure_style = Style::default()
+        .fg(Color::Red)
+        .add_modifier(Modifier::RAPID_BLINK | Modifier::CROSSED_OUT);
+    let rows = app.servers.iter().map(|s| {
+        let style = if s.status == "Up" {
+            up_style
+        } else {
+            failure_style
+        };
+        Row::new(vec![s.name, s.location, s.status]).style(style)
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(15),
+            Constraint::Length(15),
+            Constraint::Length(10),
+        ],
+    )
+    .header(
+        Row::new(vec!["Server", "Location", "Status"])
+            .style(Style::default().fg(Color::Yellow))
+            .bottom_margin(1),
+    )
+    .block(Block::bordered().title("Servers"));
+    frame.render_widget(table, chunks[0]);
+
+    let map = Canvas::default()
+        .block(Block::bordered().title("World"))
+        .paint(|ctx| {
+            ctx.draw(&Map {
+                color: Color::White,
+                resolution: MapResolution::High,
+            });
+            ctx.layer();
+            ctx.draw(&Rectangle {
+                x: 0.0,
+                y: 30.0,
+                width: 10.0,
+                height: 10.0,
+                color: Color::Yellow,
+            });
+            ctx.draw(&Circle {
+                x: app.servers[2].coords.1,
+                y: app.servers[2].coords.0,
+                radius: 10.0,
+                color: Color::LightGreen,
+            });
+            for (i, s1) in app.servers.iter().enumerate() {
+                for s2 in &app.servers[i + 1..] {
+                    ctx.draw(&canvas::Line {
+                        x1: s1.coords.1,
+                        y1: s1.coords.0,
+                        y2: s2.coords.0,
+                        x2: s2.coords.1,
+                        color: Color::Yellow,
+                    });
+                }
+            }
+            for server in &app.servers {
+                let color = if server.status == "Up" {
+                    Color::LightGreen
+                } else {
+                    Color::Red
+                };
+                ctx.print(
+                    server.coords.1,
+                    server.coords.0,
+                    Span::styled("X", Style::default().fg(color)),
+                );
+            }
+        })
+        .marker(if app.enhanced_graphics {
+            symbols::Marker::Braille
+        } else {
+            symbols::Marker::Dot
+        })
+        .x_bounds([-180.0, 180.0])
+        .y_bounds([-90.0, 90.0]);
+    frame.render_widget(map, chunks[1]);
+}
+
+fn draw_third_tab(frame: &mut Frame, _app: &mut App, area: Rect) {
+    let chunks = Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).split(area);
+    let colors = [
+        Color::Reset,
+        Color::Black,
+        Color::Red,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::LightMagenta,
+        Color::Cyan,
+        Color::Gray,
+        Color::DarkGray,
+        Color::LightRed,
+        Color::LightGreen,
+        Color::LightYellow,
+        Color::LightBlue,
+        Color::LightMagenta,
+        Color::LightCyan,
+        Color::White,
+    ];
+    let items: Vec<Row> = colors
+        .iter()
+        .map(|c| {
+            let cells = vec![
+                Cell::from(Span::raw(format!("{c:?}: "))),
+                Cell::from(Span::styled("Foreground", Style::default().fg(*c))),
+                Cell::from(Span::styled("Background", Style::default().bg(*c))),
+            ];
+            Row::new(cells)
+        })
+        .collect();
+    let table = Table::new(
+        items,
+        [
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+        ],
+    )
+    .block(Block::bordered().title("Colors"));
+    frame.render_widget(table, chunks[0]);
+}

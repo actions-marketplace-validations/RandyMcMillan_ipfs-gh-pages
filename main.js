@@ -20,6 +20,8 @@ import { zipSync } from 'fflate';
 import { multiaddr } from '@multiformats/multiaddr';
 import { formatSize, base64ToUint8Array, uint8ArrayToBase64, buildRepoTree, isBrowserDialable, normalizeAddressForProxy } from './lib/shared.mjs';
 
+import { classifyIndexSync } from './js/index-merge.js';
+
 // Repo identity: prefer the Pages origin (<owner>.github.io/<repo>), then the
 // build-time identity baked by the action (GITHUB_REPOSITORY / git remote), so
 // the chrome is correct for whoever deploys this app.
@@ -966,6 +968,38 @@ function getIpnsBranchKey() {
   return ipnsBranchKeyPromise;
 }
 
+// Interop probe (docs/interop.md): the rust app serves its bridge's
+// identity bundle on the fixed loopback port 5050. Loopback fetch from an
+// https page is not mixed-content-blocked, so the Pages deployment can
+// reach it. Silent adopt when this origin has no key yet; when keys
+// differ, expose the bundle as window.__pendingIdentityAdoption for the
+// UI instead of deciding for the user.
+async function probeInteropIdentity() {
+  try {
+    const res = await fetch('http://127.0.0.1:5050/well-known/identity');
+    if (!res.ok) return;
+    const bundle = await res.json();
+    if (!bundle || typeof bundle.key !== 'string' || !bundle.key) return;
+    const storageKey = `ipns-branch-key:${repoFullName}`;
+    if (!localStorage.getItem(storageKey)) {
+      localStorage.setItem(storageKey, bundle.key);
+      ipnsBranchKeyPromise = null; // re-read on next getIpnsBranchKey()
+      window.__identityAdopted = bundle.peerId || null;
+      console.log(`interop: adopted local identity ${bundle.peerId}`);
+      return;
+    }
+    if (bundle.peerId) {
+      const localKey = await getIpnsBranchKey();
+      if (peerIdFromPrivateKey(localKey).toString() !== bundle.peerId) {
+        window.__pendingIdentityAdoption = bundle;
+        console.log('interop: local identity differs; see window.__pendingIdentityAdoption');
+      }
+    }
+  } catch {
+    // no local rust app running — the normal case for most visitors
+  }
+}
+
 async function publishBranchPointer(rootCid) {
 
   const field = document.getElementById('code-ipns-field');
@@ -1114,6 +1148,11 @@ async function initHelia() {
     }
 
     const peerId = heliaNode.libp2p.peerId.toString();
+
+    // Interop (docs/interop.md): if the local rust app publishes an
+    // identity on 127.0.0.1:5050, adopt it when we have no key yet, or
+    // surface it for the UI when it differs from ours.
+    probeInteropIdentity();
 
     statusEl.textContent = 'Online & Connected to Peer-to-Peer Network';
     peerIdEl.textContent = peerId;
@@ -2811,6 +2850,34 @@ document.querySelectorAll('.tab-button[data-tab]').forEach((button) => {
 window.addEventListener('hashchange', applyRoute);
 applyRoute();
 
+// ipfs:// URI support (docs/ipfs-uri-providers.md): clicking an ipfs:// or
+// ipns:// link fetches in-app through our own Helia node — works on every
+// platform with no extension. web+ipfs/web+ipns protocol handlers land
+// external "open in app" requests on the same path via ?uri=.
+function openUri(uri) {
+  const m = uri.match(/^ip[fn]s:\/\/([^/?#]+)/i) || uri.match(/^web\+ip[fn]s:\/\/([^/?#]+)/i);
+  if (!m) return false;
+  activateTab('files');
+  if (inputCid) inputCid.value = m[1];
+  fetchContent(m[1]);
+  return true;
+}
+
+document.addEventListener('click', (e) => {
+  const a = e.target.closest && e.target.closest('a[href^="ipfs://"],a[href^="ipns://"],a[href^="web+ipfs://"],a[href^="web+ipns://"]');
+  if (!a) return;
+  e.preventDefault();
+  openUri(a.getAttribute('href'));
+});
+
+try {
+  navigator.registerProtocolHandler('web+ipfs', `${location.origin}${basePath()}/?uri=%s`, 'ipfs-gh-pages');
+  navigator.registerProtocolHandler('web+ipns', `${location.origin}${basePath()}/?uri=%s`, 'ipfs-gh-pages');
+} catch {}
+
+const uriParam = new URLSearchParams(window.location.search).get('uri');
+if (uriParam) openUri(uriParam);
+
 // Settings endpoint deep-link: open the Peer tab's Settings sub-tab.
 const openNodeSettingsBtn = document.getElementById('btn-open-node-settings');
 if (openNodeSettingsBtn) {
@@ -2880,6 +2947,47 @@ let pendingIssueAnchor = null;
 const CHAIN_KEY = 'repo-index-chain';
 const LAMPORT_KEY = 'repo-index-lamport';
 
+// Phase 10: the index tip gets its OWN IPNS name (one name holds one
+// value; the branch pointer already uses the repo key — docs/issues-car.md
+// "the index tip, published at an IPNS name"). Same key derivation and
+// localStorage scheme as the branch key, so interop identity adoption
+// (docs/interop.md) carries the index name across surfaces too.
+let ipnsIndexKeyPromise = null;
+function getIpnsIndexKey() {
+  if (!ipnsIndexKeyPromise) {
+    ipnsIndexKeyPromise = (async () => {
+      const storageKey = `ipns-index-key:${repoFullName}`;
+      const stored = localStorage.getItem(storageKey);
+      if (stored) {
+        try {
+          return privateKeyFromRaw(base64ToUint8Array(stored));
+        } catch {}
+      }
+      const key = await generateKeyPair('Ed25519');
+      localStorage.setItem(storageKey, uint8ArrayToBase64(key.raw));
+      return key;
+    })();
+  }
+  return ipnsIndexKeyPromise;
+}
+
+function indexIpnsName() {
+  return getIpnsIndexKey().then((key) => `/ipns/${peerIdFromPrivateKey(key)}`);
+}
+
+// Publish the chain tip to the index IPNS name. Fire-and-forget: IPNS
+// publishing is slow (DHT put) and must never block issue creation.
+function publishIndexTip(tipCid) {
+  if (!heliaNode || !tipCid) return;
+  (async () => {
+    try {
+      const key = await getIpnsIndexKey();
+      await ipns(heliaNode).publish(key, CID.parse(String(tipCid)));
+      window.__indexIpnsLastPublish = Date.now();
+    } catch {}
+  })();
+}
+
 function loadChainTip() {
   try { return JSON.parse(localStorage.getItem(CHAIN_KEY) || 'null'); } catch { return null; }
 }
@@ -2922,6 +3030,7 @@ async function extendChain(addedCids) {
   try {
     localStorage.setItem(CHAIN_KEY, JSON.stringify({ cid, height, lamport, added: addedCids.length }));
   } catch {}
+  publishIndexTip(cid);
   renderChainStatus();
   return cid;
 }
@@ -2941,6 +3050,9 @@ function renderChainStatus() {
   meta.className = 'f6 color-fg-muted';
   meta.style.wordBreak = 'break-all';
   meta.textContent = `Index chain: height ${tip.height} · tip ${tip.cid}`;
+  indexIpnsName().then((name) => {
+    meta.textContent += ` · index name ${name} (resolves while a publisher is online)`;
+  }).catch(() => {});
   const pre = document.createElement('pre');
   pre.style.margin = '0.2rem 0 0 0';
   const code = document.createElement('code');
@@ -2948,6 +3060,100 @@ function renderChainStatus() {
   pre.appendChild(code);
   el.appendChild(meta);
   el.appendChild(pre);
+}
+
+// Phase 10 cross-surface sync (docs/interop.md step 4): resolve our index
+// IPNS name; if a remote tip wins the fork-choice rule (greater height,
+// tie -> greater lamport), adopt it, then walk its `added` note CIDs
+// (bounded) merging fetched issues into the local list so they render.
+// Signature verification happens when an issue is opened.
+async function syncIndexFromIpns() {
+  if (!heliaNode) return;
+  try {
+    const name = await indexIpnsName();
+    const result = await ipns(heliaNode).resolve(name, { timeout: 8000 }).catch(() => null);
+    if (!result) return;
+    const remoteCid = result.value || result.path || result;
+    const remoteStr = remoteCid.toString().replace(/^\/ipfs\//, '');
+    const local = loadChainTip();
+    if (!remoteStr || (local && remoteStr === local.cid)) return;
+    const remoteEntry = await getDagJson(CID.parse(remoteStr));
+
+    const descendsFrom = async (tipCid, ancestorCid, maxSteps = 50) => {
+      let cursor = tipCid;
+      for (let i = 0; i < maxSteps && cursor; i++) {
+        if (cursor === ancestorCid) return true;
+        try {
+          const entry = await getDagJson(CID.parse(cursor));
+          cursor = Array.isArray(entry?.prev) ? entry.prev[0] : null;
+        } catch { break; }
+      }
+      return false;
+    };
+
+    // Collect remote notes missing locally (bounded) — feeds both the
+    // issues view and the merge entry's `added`.
+    const missingNotes = [];
+    {
+      const known = new Set(loadIssues().map((i) => i.cid));
+      let cursor = remoteEntry;
+      let walked = 0;
+      while (cursor && walked < 50) {
+        for (const noteCid of cursor.added || []) {
+          if (known.has(noteCid)) continue;
+          try {
+            const note = await getDagJson(CID.parse(noteCid));
+            if (note && note.ns === 'issues' && note.type === 'issue' && note.title) {
+              missingNotes.push({ cid: noteCid, title: note.title, timestamp: note.timestamp });
+              known.add(noteCid);
+            }
+          } catch {}
+        }
+        const prev = Array.isArray(cursor.prev) ? cursor.prev[0] : null;
+        if (!prev) break;
+        try { cursor = await getDagJson(CID.parse(prev)); } catch { break; }
+        walked++;
+      }
+    }
+
+    const decision = classifyIndexSync(
+      local,
+      { cid: remoteStr, height: Number(remoteEntry?.height) || 0, lamport: Number(remoteEntry?.lamport) || 0 },
+      local ? await descendsFrom(remoteStr, local.cid) : false,
+      local ? await descendsFrom(local.cid, remoteStr) : false
+    );
+    if (decision.action === 'noop') return;
+    if (decision.action === 'adopt-remote') {
+      localStorage.setItem(CHAIN_KEY, JSON.stringify({
+        cid: remoteStr,
+        height: Number(remoteEntry.height) || 0,
+        lamport: Number(remoteEntry.lamport) || 0,
+        added: Array.isArray(remoteEntry.added) ? remoteEntry.added.length : 0
+      }));
+      try { localStorage.setItem(LAMPORT_KEY, String(Number(remoteEntry.lamport) || 0)); } catch {}
+    } else {
+      // Divergence: merge entry, both parents, union of missing notes.
+      const { envelope } = await signNote({
+        type: 'index-entry',
+        added: missingNotes.map((n) => n.cid),
+        prev: [local.cid, remoteStr],
+        height: decision.height,
+        lamport: decision.lamport,
+        timestamp: new Date().toISOString()
+      });
+      const tipCid = await publishNote(envelope);
+      localStorage.setItem(CHAIN_KEY, JSON.stringify({ cid: tipCid, height: decision.height, lamport: decision.lamport, added: missingNotes.length }));
+      publishIndexTip(tipCid);
+    }
+
+    if (missingNotes.length) {
+      const issues = loadIssues();
+      issues.unshift(...missingNotes);
+      localStorage.setItem(ISSUES_KEY, JSON.stringify(issues.slice(0, 200)));
+    }
+    renderChainStatus();
+    renderIssues();
+  } catch {}
 }
 
 function renderIssues() {
@@ -3191,6 +3397,14 @@ if (issueReplyBtn) {
 }
 renderIssues();
 renderChainStatus();
+// Phase 10: adopt a winning remote index tip (cross-surface issues).
+// Runs once the Helia node is up; resolves quietly when offline.
+const syncIndexWhenReady = setInterval(() => {
+  if (window.__heliaNode) {
+    clearInterval(syncIndexWhenReady);
+    syncIndexFromIpns();
+  }
+}, 2000);
 
 // DESIGN IDIOM — single-click copy (keep this pattern; see the matching
 // block in index.html's CSS): EVERY command displayed anywhere on the page
