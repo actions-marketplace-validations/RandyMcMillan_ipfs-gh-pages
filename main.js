@@ -21,6 +21,8 @@ import { multiaddr } from '@multiformats/multiaddr';
 import { formatSize, base64ToUint8Array, uint8ArrayToBase64, buildRepoTree, isBrowserDialable, normalizeAddressForProxy } from './lib/shared.mjs';
 
 import { classifyIndexSync } from './js/index-merge.js';
+import { normalizeLineRange, makeLineCommentFields, isLineCommentNote, commentsByLine } from './js/line-comments.js';
+import { collectReleases, blameLines, blameCommentMatches } from './js/blame.js';
 
 // Repo identity: prefer the Pages origin (<owner>.github.io/<repo>), then the
 // build-time identity baked by the action (GITHUB_REPOSITORY / git remote), so
@@ -480,6 +482,7 @@ const blobView = document.getElementById('blob-view');
 const treeView = document.getElementById('tree-view');
 let blobCurrentBytes = null;
 let blobCurrentCid = null;
+let blobCurrentPath = null;
 
 function showFileBlob(path) {
   const b64 = repoFiles[path];
@@ -488,6 +491,7 @@ function showFileBlob(path) {
   const text = new TextDecoder().decode(bytes);
   blobCurrentBytes = bytes;
   blobCurrentCid = repoTreeCids.get(path) || null;
+  blobCurrentPath = path;
 
   const repoLink = document.getElementById('blob-repo-link');
   repoLink.textContent = repoName;
@@ -525,6 +529,8 @@ function showFileBlob(path) {
 
   treeView.hidden = true;
   blobView.hidden = false;
+  resetLineCommentUi();
+  renderLineGutter();
   blobView.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
@@ -533,6 +539,8 @@ function hideFileBlob() {
   if (treeView) treeView.hidden = false;
   blobCurrentBytes = null;
   blobCurrentCid = null;
+  blobCurrentPath = null;
+  resetLineCommentUi();
 }
 
 const blobRepoLink = document.getElementById('blob-repo-link');
@@ -576,6 +584,487 @@ if (blobDownloadBtn) {
     const path = document.getElementById('blob-path').textContent.replace(/\s*\/\s*/g, '/').replace(/^\//, '').trim();
     downloadBytes(blobCurrentBytes, path.split('/').pop() || 'file');
   });
+}
+
+// ---- Line comments (docs/issues-car.md phase 9) --------------------------------
+// Granular review on the blob view: select lines in the code, comment; the
+// note is a signed `line-comment` anchored to this exact blob CID, so
+// (cid, line) is an immutable coordinate — the CID pins the content the
+// range was filed against. Gutter markers render from the local index;
+// clicking one lists the file's fetched-and-verified comments below the code.
+
+const LINE_COMMENTS_KEY = 'repo-line-comments';
+const BLAME_COMMENTS_KEY = 'repo-blame-comments';
+const lineBarEl = document.getElementById('line-comment-bar');
+const lineBarBtn = document.getElementById('btn-line-comment-start');
+const lineComposerEl = document.getElementById('line-comment-composer');
+const linePanelEl = document.getElementById('line-comment-panel');
+// The composer carries one pending comment: a line-comment range or a
+// blame-comment coordinate (line + origin release root).
+let pendingComment = null;
+
+function loadLineCommentIndex() {
+  try { return JSON.parse(localStorage.getItem(LINE_COMMENTS_KEY) || '{}'); } catch { return {}; }
+}
+
+function saveLineCommentIndex(index) {
+  try { localStorage.setItem(LINE_COMMENTS_KEY, JSON.stringify(index)); } catch {}
+}
+
+function blobLineRows() {
+  const codeEl = document.getElementById('blob-code');
+  return codeEl ? Array.from(codeEl.querySelectorAll('.line')) : [];
+}
+
+// Selection → 1-based line range; null unless both ends sit inside the
+// rendered code (selecting page chrome must not offer a line comment).
+function currentBlobSelectionRange() {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
+  const codeEl = document.getElementById('blob-code');
+  if (!codeEl || !blobView || blobView.hidden) return null;
+  const { anchorNode, focusNode } = sel;
+  if (!anchorNode || !focusNode || !codeEl.contains(anchorNode) || !codeEl.contains(focusNode)) return null;
+  const rowOf = (node) => {
+    let el = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+    while (el && el !== codeEl) {
+      if (el.classList && el.classList.contains('line')) return el;
+      el = el.parentElement;
+    }
+    return null;
+  };
+  const rows = blobLineRows();
+  const ai = rows.indexOf(rowOf(anchorNode));
+  const fi = rows.indexOf(rowOf(focusNode));
+  if (ai < 0 || fi < 0) return null;
+  return normalizeLineRange(ai + 1, fi + 1);
+}
+
+function hideLineBar() {
+  if (lineBarEl) lineBarEl.hidden = true;
+}
+
+// Floating "Comment on lines X–Y" action pinned above the selection's last
+// line; hidden again whenever the selection collapses or the view scrolls.
+function updateLineBar() {
+  if (!lineBarEl || !blobView || blobView.hidden) return;
+  const range = currentBlobSelectionRange();
+  const rows = blobLineRows();
+  const row = range ? rows[range.end - 1] : null;
+  if (!range || !row) {
+    hideLineBar();
+    return;
+  }
+  lineBarBtn.textContent = `💬 Comment on lines ${range.start}–${range.end}`;
+  const rect = row.getBoundingClientRect();
+  lineBarEl.style.top = `${Math.max(6, rect.top - 42)}px`;
+  lineBarEl.style.left = `${Math.max(6, Math.min(rect.left, window.innerWidth - 300))}px`;
+  lineBarEl.hidden = false;
+}
+
+document.addEventListener('selectionchange', updateLineBar);
+window.addEventListener('scroll', hideLineBar, { passive: true });
+window.addEventListener('resize', hideLineBar);
+
+if (lineBarBtn) {
+  lineBarBtn.addEventListener('click', () => {
+    const range = currentBlobSelectionRange();
+    if (!range) return;
+    pendingComment = { kind: 'line', range };
+    hideLineBar();
+    window.getSelection()?.removeAllRanges();
+    openLineComposer();
+  });
+}
+
+function openLineComposer() {
+  if (!lineComposerEl || !pendingComment) return;
+  const heading = document.getElementById('line-comment-heading');
+  const path = (document.getElementById('blob-path')?.textContent || '').trim();
+  if (heading) {
+    if (pendingComment.kind === 'blame') {
+      const originTimestamp = pendingComment.originTimestamp ? ` · ${pendingComment.originTimestamp}` : '';
+      heading.textContent = `Blame comment on ${path || '(file)'} line ${pendingComment.line} — originates in ${pendingComment.origin}${originTimestamp} · rides this line across later versions`;
+    } else {
+      heading.textContent = `Commenting on ${path || '(file)'} — lines ${pendingComment.range.start}–${pendingComment.range.end}, anchored to ${blobCurrentCid}`;
+    }
+  }
+  const bodyEl = document.getElementById('line-comment-body');
+  if (bodyEl) bodyEl.value = '';
+  const statusEl = document.getElementById('line-comment-status');
+  if (statusEl) statusEl.textContent = '';
+  lineComposerEl.hidden = false;
+  bodyEl?.focus();
+}
+
+function hideLineComposer() {
+  pendingComment = null;
+  if (lineComposerEl) lineComposerEl.hidden = true;
+}
+
+// Gutter: tint annotated rows and drop a marker (with count) in the line
+// number cell. The marker pairs glyph+count with the tint so the meaning
+// never rides on color alone.
+function renderLineGutter() {
+  const rows = blobLineRows();
+  rows.forEach((row) => {
+    row.classList.remove('line-commented');
+    row.querySelectorAll('.ln-marker').forEach((m) => m.remove());
+  });
+  if (!blobCurrentCid) return;
+  const stored = loadLineCommentIndex()[blobCurrentCid] || [];
+  if (!stored.length) return;
+  const byLine = commentsByLine(stored);
+  rows.forEach((row, i) => {
+    const list = byLine.get(i + 1);
+    if (!list) return;
+    row.classList.add('line-commented');
+    const ln = row.querySelector('.ln');
+    if (!ln) return;
+    const marker = document.createElement('button');
+    marker.type = 'button';
+    marker.className = 'ln-marker';
+    marker.textContent = list.length > 1 ? `💬${list.length}` : '💬';
+    const label = `${list.length} comment(s) on line ${i + 1}`;
+    marker.title = label;
+    marker.setAttribute('aria-label', label);
+    marker.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openLineCommentPanel(i + 1);
+    });
+    ln.appendChild(marker);
+  });
+  renderBlameGutter();
+}
+
+// Fetch + verify one comment note for the panel; a valid signature on a
+// malformed note still must not render as a line comment.
+async function renderLineCommentBody(item, holder) {
+  if (!heliaNode) {
+    holder.textContent = 'Node offline — cannot fetch this comment.';
+    return;
+  }
+  try {
+    const note = await getDagJson(CID.parse(item.cid));
+    const { ok, signed, signer } = await verifyNote(note);
+    if (!ok || !isLineCommentNote(signed)) {
+      holder.style.color = 'var(--fgColor-danger, #cf222e)';
+      holder.textContent = `✗ invalid note at ${item.cid}`;
+      return;
+    }
+    holder.textContent = '';
+    const meta = document.createElement('div');
+    meta.className = 'f6 color-fg-muted';
+    meta.style.wordBreak = 'break-all';
+    meta.textContent = `✓ ${signer} · ${signed.timestamp} · ${item.cid}`;
+    const body = document.createElement('div');
+    body.textContent = signed.body;
+    const pin = document.createElement('pre');
+    pin.style.margin = '0.15rem 0 0 0';
+    const code = document.createElement('code');
+    code.textContent = `ipfs pin add ${item.cid}`;
+    pin.appendChild(code);
+    holder.appendChild(meta);
+    holder.appendChild(body);
+    holder.appendChild(pin);
+  } catch {
+    holder.textContent = `${item.cid} — unavailable (no provider)`;
+  }
+}
+
+// The file's line comments, newest-indexed first, each jumping to its
+// range on click/Enter.
+function openLineCommentPanel() {
+  if (!linePanelEl || !blobCurrentCid) return;
+  const stored = (loadLineCommentIndex()[blobCurrentCid] || []).slice()
+    .sort((a, b) => (a.start - b.start) || String(a.cid).localeCompare(String(b.cid)));
+  if (!stored.length) {
+    linePanelEl.hidden = true;
+    return;
+  }
+  linePanelEl.innerHTML = '';
+  const head = document.createElement('div');
+  head.className = 'line-comment-panel-head';
+  head.textContent = `Line comments on this file (${stored.length}) — anchored to ${blobCurrentCid}`;
+  linePanelEl.appendChild(head);
+  for (const item of stored) {
+    const range = normalizeLineRange(item.start, item.end);
+    const row = document.createElement('div');
+    row.className = 'line-comment-item';
+    row.tabIndex = 0;
+    const chip = document.createElement('span');
+    chip.className = 'line-comment-chip';
+    chip.textContent = range.start === range.end ? `L${range.start}` : `L${range.start}–L${range.end}`;
+    const holder = document.createElement('div');
+    holder.className = 'f6 color-fg-muted';
+    holder.style.flex = '1';
+    holder.style.wordBreak = 'break-all';
+    holder.textContent = 'Fetching…';
+    row.appendChild(chip);
+    row.appendChild(holder);
+    const jump = () => {
+      const rows = blobLineRows();
+      rows.forEach((r, i) => r.classList.toggle('line-flash', i + 1 >= range.start && i + 1 <= range.end));
+      rows[range.start - 1]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      setTimeout(() => rows.forEach((r) => r.classList.remove('line-flash')), 1600);
+    };
+    row.addEventListener('click', jump);
+    row.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        jump();
+      }
+    });
+    linePanelEl.appendChild(row);
+    renderLineCommentBody(item, holder);
+  }
+  linePanelEl.hidden = false;
+}
+
+async function createLineComment() {
+  if (pendingComment?.kind === 'blame') return createBlameComment();
+  const statusEl = document.getElementById('line-comment-status');
+  const bodyEl = document.getElementById('line-comment-body');
+  const btn = document.getElementById('btn-line-comment-submit');
+  if (!blobCurrentCid || pendingComment?.kind !== 'line') {
+    if (statusEl) statusEl.textContent = 'Select a line range in the code first.';
+    return;
+  }
+  const fields = makeLineCommentFields({
+    fileCid: blobCurrentCid,
+    start: pendingComment.range.start,
+    end: pendingComment.range.end,
+    body: bodyEl?.value,
+    timestamp: new Date().toISOString()
+  });
+  if (!fields) {
+    if (statusEl) statusEl.textContent = 'Write a comment first.';
+    return;
+  }
+  if (!heliaNode) {
+    if (statusEl) statusEl.textContent = 'Wait for the node to come online.';
+    return;
+  }
+  if (btn) btn.disabled = true;
+  if (statusEl) statusEl.textContent = 'Signing and publishing…';
+  try {
+    const { envelope, signer } = await signNote(fields);
+    const cid = await publishNote(envelope);
+    const index = loadLineCommentIndex();
+    (index[blobCurrentCid] = index[blobCurrentCid] || []).unshift({
+      cid, start: fields.line.start, end: fields.line.end, timestamp: fields.timestamp, signer
+    });
+    saveLineCommentIndex(index);
+    await extendChain([cid]);
+    if (statusEl) statusEl.textContent = `Commented — ${cid}`;
+    if (bodyEl) bodyEl.value = '';
+    renderLineGutter();
+    openLineCommentPanel();
+  } catch (err) {
+    if (statusEl) statusEl.textContent = `Failed: ${err.message}`;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// A blame comment anchors to the ORIGIN of a line (its release root), not
+// the version — { ns:'review', type:'blame-comment', anchors:[fileCid],
+// line:{start}, origin }. It surfaces on every later version whose blame
+// attributes that line to the same origin (blameCommentMatches).
+async function createBlameComment() {
+  const statusEl = document.getElementById('line-comment-status');
+  const bodyEl = document.getElementById('line-comment-body');
+  const btn = document.getElementById('btn-line-comment-submit');
+  const pending = pendingComment;
+  const body = (bodyEl?.value || '').trim();
+  if (!blobCurrentCid || pending?.kind !== 'blame' || !pending.origin || !body) {
+    if (statusEl) statusEl.textContent = 'Write a comment first.';
+    return;
+  }
+  if (!heliaNode) {
+    if (statusEl) statusEl.textContent = 'Wait for the node to come online.';
+    return;
+  }
+  if (btn) btn.disabled = true;
+  if (statusEl) statusEl.textContent = 'Signing and publishing…';
+  try {
+    const { envelope, signer } = await signNote({
+      ns: 'review',
+      type: 'blame-comment',
+      anchors: [blobCurrentCid],
+      line: { start: pending.line },
+      origin: pending.origin,
+      body,
+      timestamp: new Date().toISOString()
+    });
+    const cid = await publishNote(envelope);
+    const list = loadBlameCommentIndex();
+    list.unshift({
+      cid, anchor: blobCurrentCid, line: pending.line, origin: pending.origin,
+      timestamp: envelope.timestamp, signer
+    });
+    saveBlameCommentIndex(list);
+    await extendChain([cid]);
+    if (statusEl) statusEl.textContent = `Commented — ${cid}`;
+    if (bodyEl) bodyEl.value = '';
+    renderBlameGutter();
+  } catch (err) {
+    if (statusEl) statusEl.textContent = `Failed: ${err.message}`;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// ---- Blame (docs/issues-car.md phase 11) ---------------------------------------
+// The Blame toggle computes per-line origin attribution over the release
+// chain and renders an origin column; every blame cell can carry a
+// blame-comment, which rides the line's history across later versions.
+
+const blameToggleBtn = document.getElementById('btn-blame-toggle');
+let blameOn = false;
+let blameOrigins = null; // array parallel to the file's lines, or null
+let blameReleases = [];
+
+function loadBlameCommentIndex() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(BLAME_COMMENTS_KEY) || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveBlameCommentIndex(list) {
+  try { localStorage.setItem(BLAME_COMMENTS_KEY, JSON.stringify(list.slice(0, 500))); } catch {}
+}
+
+// The release chain for THIS checkout: local tips (recorded at publish
+// time), newest first. Fetched-repo roots have no chain here — history
+// before the chain exists attributes to the current root, the genesis
+// release (same as git blame at a root commit: earlier content is
+// unattributable).
+function loadBlameReleases() {
+  const currentRoot = outputCid?.textContent?.trim();
+  const releases = collectReleases(loadReleaseTips());
+  if (currentRoot && !releases.some((r) => r.root === currentRoot)) {
+    return [{ cid: null, root: currentRoot, timestamp: null }, ...releases];
+  }
+  return releases;
+}
+
+// File lines at a path under a release root; null when absent/unfetchable.
+async function blameFileLines(root) {
+  if (!heliaUnixfs || !blobCurrentPath || !root) return null;
+  try {
+    const stat = await heliaUnixfs.stat(CID.parse(root), { path: blobCurrentPath });
+    if (stat.type === 'directory') return null;
+    const chunks = [];
+    for await (const chunk of heliaUnixfs.cat(stat.cid)) chunks.push(chunk);
+    const total = chunks.reduce((n, c) => n + c.length, 0);
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+    return new TextDecoder().decode(bytes).replace(/\n$/, '').split('\n');
+  } catch {
+    return null;
+  }
+}
+
+async function computeBlame() {
+  const codeEl = document.getElementById('blob-code');
+  if (!codeEl) return;
+  blameReleases = loadBlameReleases();
+  // The file's true lines, exactly as published (the rendered rows use a
+  // ' ' placeholder for empty lines, which would never match a release's
+  // empty string).
+  const currentText = new TextDecoder().decode(blobCurrentBytes || new Uint8Array());
+  const currentLines = currentText.replace(/\n$/, '').split('\n');
+  if (!currentLines.length) return;
+  // Doc optimization: a file whose CID is unchanged between consecutive
+  // roots has identical content, so keep the last fetched lines instead of
+  // refetching.
+  let lastFileCid = null;
+  let lastLines = null;
+  const fetchFileLines = async (root) => {
+    const stat = await heliaUnixfs.stat(CID.parse(root), { path: blobCurrentPath });
+    if (stat.type === 'directory') return null;
+    const fileCid = stat.cid.toString();
+    if (fileCid === lastFileCid && lastLines) return lastLines;
+    const chunks = [];
+    for await (const chunk of heliaUnixfs.cat(stat.cid)) chunks.push(chunk);
+    const total = chunks.reduce((n, c) => n + c.length, 0);
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+    lastFileCid = fileCid;
+    lastLines = new TextDecoder().decode(bytes).replace(/\n$/, '').split('\n');
+    return lastLines;
+  };
+  blameOrigins = await blameLines(currentLines, blameReleases, fetchFileLines);
+}
+
+function renderBlameGutter() {
+  blobLineRows().forEach((row) => {
+    row.querySelectorAll('.bl').forEach((el) => el.remove());
+  });
+  if (!blameOn || !blameOrigins) return;
+  const comments = loadBlameCommentIndex();
+  blobLineRows().forEach((row, i) => {
+    const origin = blameOrigins[i];
+    if (!origin) return;
+    const bl = document.createElement('button');
+    bl.type = 'button';
+    bl.className = 'bl';
+    const count = comments.filter((c) => blameCommentMatches(c, origin.root, i + 1)).length;
+    bl.textContent = `${origin.timestamp || 'release'}${count > 0 ? ` 💬${count}` : ' ＋'}`;
+    bl.title = `Line ${i + 1} originates in release ${origin.root} — click to comment on this origin`;
+    bl.setAttribute('aria-label', bl.title);
+    bl.addEventListener('click', (e) => {
+      e.stopPropagation();
+      pendingComment = { kind: 'blame', line: i + 1, origin: origin.root, originTimestamp: origin.timestamp };
+      openLineComposer();
+    });
+    row.insertBefore(bl, row.querySelector('.lc'));
+  });
+}
+
+async function toggleBlame() {
+  if (!blobView || blobView.hidden) return;
+  blameOn = !blameOn;
+  if (blameToggleBtn) blameToggleBtn.setAttribute('aria-pressed', String(blameOn));
+  const codeEl = document.getElementById('blob-code');
+  if (codeEl) codeEl.classList.toggle('blame-on', blameOn);
+  if (blameOn) {
+    if (blameToggleBtn) blameToggleBtn.disabled = true;
+    try {
+      await computeBlame();
+    } finally {
+      if (blameToggleBtn) blameToggleBtn.disabled = false;
+    }
+  } else {
+    blameOrigins = null;
+  }
+  renderBlameGutter();
+}
+
+if (blameToggleBtn) {
+  blameToggleBtn.setAttribute('aria-pressed', 'false');
+  blameToggleBtn.addEventListener('click', toggleBlame);
+}
+
+const lineSubmitBtn = document.getElementById('btn-line-comment-submit');
+if (lineSubmitBtn) lineSubmitBtn.addEventListener('click', createLineComment);
+const lineCancelBtn = document.getElementById('btn-line-comment-cancel');
+if (lineCancelBtn) lineCancelBtn.addEventListener('click', hideLineComposer);
+
+function resetLineCommentUi() {
+  hideLineBar();
+  hideLineComposer();
+  if (linePanelEl) linePanelEl.hidden = true;
+  blameOn = false;
+  blameOrigins = null;
+  blameReleases = [];
+  if (blameToggleBtn) blameToggleBtn.setAttribute('aria-pressed', 'false');
 }
 
 // Export a CID (and its full DAG) as CAR bytes. CarWriter streams block
@@ -1023,6 +1512,52 @@ async function publishBranchPointer(rootCid) {
   }
 }
 
+// ---- Release chain (docs/issues-car.md phase 10) -------------------------------
+// Every publish of a NEW repo root records a release-commit object
+// { type:'release', root, prev, timestamp } — the git-commit analog the
+// DAG was missing, and what blame (phase 11) walks. The object is plain
+// dag-json (no signature — the data model keeps releases as history links;
+// blame attribution is advisory). Dedup: publishing an unchanged tree
+// yields the same root CID, so the chain only advances when content does.
+
+const RELEASE_CHAIN_KEY = 'repo-release-chain';
+
+function loadReleaseTips() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(RELEASE_CHAIN_KEY) || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveReleaseTips(tips) {
+  try { localStorage.setItem(RELEASE_CHAIN_KEY, JSON.stringify(tips.slice(0, 50))); } catch {}
+}
+
+// Record `rootCidStr` as a release; no-op when it matches the current tip
+// (same content republished). Returns the release record or null.
+async function recordRelease(rootCidStr) {
+  if (!heliaNode || !rootCidStr) return null;
+  const tips = loadReleaseTips();
+  if (tips[0] && tips[0].root === rootCidStr) return tips[0];
+  const obj = {
+    type: 'release',
+    root: rootCidStr,
+    prev: tips[0] ? tips[0].cid : null,
+    timestamp: new Date().toISOString()
+  };
+  try {
+    const cid = await addDagJson(obj);
+    heliaNode.routing?.provide?.(cid).catch(() => {});
+    const record = { cid: cid.toString(), root: rootCidStr, timestamp: obj.timestamp };
+    saveReleaseTips([record, ...tips]);
+    return record;
+  } catch {
+    return null;
+  }
+}
+
 async function addAllRepoFiles() {
   if (!heliaUnixfs) return;
   statusEl.textContent = 'Adding all repository files to IPFS...';
@@ -1052,6 +1587,7 @@ async function addAllRepoFiles() {
       if (fetchRepoBtn) fetchRepoBtn.disabled = false;
       if (downloadRepoBtn) downloadRepoBtn.disabled = false;
       publishBranchPointer(rootCid).catch(() => {});
+      recordRelease(rootCidStr).catch(() => {});
       statusEl.textContent = 'Online & All repository files added to IPFS';
 
       // Announce the root CID to the IPFS network so other peers
@@ -3058,15 +3594,22 @@ function renderChainStatus() {
   const code = document.createElement('code');
   code.textContent = `ipfs pin add ${tip.cid}`;
   pre.appendChild(code);
+  // Git-host bridge (docs/issues-car.md phase 12): the pre-push hook reads
+  // this file — run the export command, then activate the hooks with
+  // `npm run githooks:activate` in a clone of the repo.
+  const exportPre = document.createElement('pre');
+  exportPre.style.margin = '0.2rem 0 0 0';
+  const exportCode = document.createElement('code');
+  exportCode.textContent = `printf '%s\\n' '${tip.cid}' > "$(git rev-parse --git-path ipfs-index-tip)"`;
+  exportPre.appendChild(exportCode);
   el.appendChild(meta);
   el.appendChild(pre);
+  el.appendChild(exportPre);
 }
 
 // Phase 10 cross-surface sync (docs/interop.md step 4): resolve our index
-// IPNS name; if a remote tip wins the fork-choice rule (greater height,
-// tie -> greater lamport), adopt it, then walk its `added` note CIDs
-// (bounded) merging fetched issues into the local list so they render.
-// Signature verification happens when an issue is opened.
+// IPNS name and hand the tip to the shared merge. Fire-and-forget on load;
+// the git-host bridge (phase 12) feeds the same merge via the button below.
 async function syncIndexFromIpns() {
   if (!heliaNode) return;
   try {
@@ -3075,85 +3618,133 @@ async function syncIndexFromIpns() {
     if (!result) return;
     const remoteCid = result.value || result.path || result;
     const remoteStr = remoteCid.toString().replace(/^\/ipfs\//, '');
-    const local = loadChainTip();
-    if (!remoteStr || (local && remoteStr === local.cid)) return;
-    const remoteEntry = await getDagJson(CID.parse(remoteStr));
+    await syncIndexFromTip(remoteStr);
+  } catch {}
+}
 
-    const descendsFrom = async (tipCid, ancestorCid, maxSteps = 50) => {
-      let cursor = tipCid;
-      for (let i = 0; i < maxSteps && cursor; i++) {
-        if (cursor === ancestorCid) return true;
+// Merge a remote index tip per the Chronology protocol (docs/issues-car.md):
+// fetch the entry (prefix closure on walk), union missing notes into the
+// local list — OR-Set semantics, so the union happens even when the chain
+// decision is noop — then adopt the remote chain or write a two-parent
+// merge entry (shared js/index-merge.js decision). Returns
+// { action, merged, tip }; throws when the tip cannot be fetched.
+async function syncIndexFromTip(remoteStr) {
+  if (!heliaNode) throw new Error('IPFS node not ready');
+  const local = loadChainTip();
+  if (!remoteStr || (local && remoteStr === local.cid)) {
+    return { action: 'noop', merged: 0, tip: (local && local.cid) || remoteStr || null };
+  }
+  const remoteEntry = await getDagJson(CID.parse(remoteStr));
+  if (!remoteEntry || remoteEntry.type !== 'index-entry') {
+    throw new Error(`${remoteStr} is not an index entry`);
+  }
+
+  const descendsFrom = async (tipCid, ancestorCid, maxSteps = 50) => {
+    let cursor = tipCid;
+    for (let i = 0; i < maxSteps && cursor; i++) {
+      if (cursor === ancestorCid) return true;
+      try {
+        const entry = await getDagJson(CID.parse(cursor));
+        cursor = Array.isArray(entry?.prev) ? entry.prev[0] : null;
+      } catch { break; }
+    }
+    return false;
+  };
+
+  // Collect remote notes missing locally (bounded) — feeds both the
+  // issues view and the merge entry's `added`.
+  const missingNotes = [];
+  {
+    const known = new Set(loadIssues().map((i) => i.cid));
+    let cursor = remoteEntry;
+    let walked = 0;
+    while (cursor && walked < 50) {
+      for (const noteCid of cursor.added || []) {
+        if (known.has(noteCid)) continue;
         try {
-          const entry = await getDagJson(CID.parse(cursor));
-          cursor = Array.isArray(entry?.prev) ? entry.prev[0] : null;
-        } catch { break; }
+          const note = await getDagJson(CID.parse(noteCid));
+          if (note && note.ns === 'issues' && note.type === 'issue' && note.title) {
+            missingNotes.push({ cid: noteCid, title: note.title, timestamp: note.timestamp });
+            known.add(noteCid);
+          }
+        } catch {}
       }
-      return false;
-    };
-
-    // Collect remote notes missing locally (bounded) — feeds both the
-    // issues view and the merge entry's `added`.
-    const missingNotes = [];
-    {
-      const known = new Set(loadIssues().map((i) => i.cid));
-      let cursor = remoteEntry;
-      let walked = 0;
-      while (cursor && walked < 50) {
-        for (const noteCid of cursor.added || []) {
-          if (known.has(noteCid)) continue;
-          try {
-            const note = await getDagJson(CID.parse(noteCid));
-            if (note && note.ns === 'issues' && note.type === 'issue' && note.title) {
-              missingNotes.push({ cid: noteCid, title: note.title, timestamp: note.timestamp });
-              known.add(noteCid);
-            }
-          } catch {}
-        }
-        const prev = Array.isArray(cursor.prev) ? cursor.prev[0] : null;
-        if (!prev) break;
-        try { cursor = await getDagJson(CID.parse(prev)); } catch { break; }
-        walked++;
-      }
+      const prev = Array.isArray(cursor.prev) ? cursor.prev[0] : null;
+      if (!prev) break;
+      try { cursor = await getDagJson(CID.parse(prev)); } catch { break; }
+      walked++;
     }
+  }
 
-    const decision = classifyIndexSync(
-      local,
-      { cid: remoteStr, height: Number(remoteEntry?.height) || 0, lamport: Number(remoteEntry?.lamport) || 0 },
-      local ? await descendsFrom(remoteStr, local.cid) : false,
-      local ? await descendsFrom(local.cid, remoteStr) : false
-    );
-    if (decision.action === 'noop') return;
-    if (decision.action === 'adopt-remote') {
-      localStorage.setItem(CHAIN_KEY, JSON.stringify({
-        cid: remoteStr,
-        height: Number(remoteEntry.height) || 0,
-        lamport: Number(remoteEntry.lamport) || 0,
-        added: Array.isArray(remoteEntry.added) ? remoteEntry.added.length : 0
-      }));
-      try { localStorage.setItem(LAMPORT_KEY, String(Number(remoteEntry.lamport) || 0)); } catch {}
-    } else {
-      // Divergence: merge entry, both parents, union of missing notes.
-      const { envelope } = await signNote({
-        type: 'index-entry',
-        added: missingNotes.map((n) => n.cid),
-        prev: [local.cid, remoteStr],
-        height: decision.height,
-        lamport: decision.lamport,
-        timestamp: new Date().toISOString()
-      });
-      const tipCid = await publishNote(envelope);
-      localStorage.setItem(CHAIN_KEY, JSON.stringify({ cid: tipCid, height: decision.height, lamport: decision.lamport, added: missingNotes.length }));
-      publishIndexTip(tipCid);
-    }
+  const decision = classifyIndexSync(
+    local,
+    { cid: remoteStr, height: Number(remoteEntry?.height) || 0, lamport: Number(remoteEntry?.lamport) || 0 },
+    local ? await descendsFrom(remoteStr, local.cid) : false,
+    local ? await descendsFrom(local.cid, remoteStr) : false
+  );
+  if (decision.action === 'adopt-remote') {
+    localStorage.setItem(CHAIN_KEY, JSON.stringify({
+      cid: remoteStr,
+      height: Number(remoteEntry.height) || 0,
+      lamport: Number(remoteEntry.lamport) || 0,
+      added: Array.isArray(remoteEntry.added) ? remoteEntry.added.length : 0
+    }));
+    try { localStorage.setItem(LAMPORT_KEY, String(Number(remoteEntry.lamport) || 0)); } catch {}
+  } else if (decision.action === 'merge') {
+    // Divergence: merge entry, both parents, union of missing notes.
+    const { envelope } = await signNote({
+      type: 'index-entry',
+      added: missingNotes.map((n) => n.cid),
+      prev: [local.cid, remoteStr],
+      height: decision.height,
+      lamport: decision.lamport,
+      timestamp: new Date().toISOString()
+    });
+    const tipCid = await publishNote(envelope);
+    localStorage.setItem(CHAIN_KEY, JSON.stringify({ cid: tipCid, height: decision.height, lamport: decision.lamport, added: missingNotes.length }));
+    publishIndexTip(tipCid);
+  }
 
-    if (missingNotes.length) {
-      const issues = loadIssues();
-      issues.unshift(...missingNotes);
-      localStorage.setItem(ISSUES_KEY, JSON.stringify(issues.slice(0, 200)));
-    }
+  if (missingNotes.length) {
+    const issues = loadIssues();
+    issues.unshift(...missingNotes);
+    localStorage.setItem(ISSUES_KEY, JSON.stringify(issues.slice(0, 200)));
+  }
+  if (decision.action !== 'noop' || missingNotes.length) {
     renderChainStatus();
     renderIssues();
-  } catch {}
+  }
+  return { action: decision.action, merged: missingNotes.length, tip: loadChainTip()?.cid || remoteStr };
+}
+
+// Git-host bridge inbound (docs/issues-car.md phase 12): a fetched notes ref
+// (the post-merge hook prints it) or a peer hands us a tip CID — paste it
+// here to merge it into the local chain and issue list.
+const indexSyncBtn = document.getElementById('btn-index-sync');
+if (indexSyncBtn) {
+  indexSyncBtn.addEventListener('click', async () => {
+    const input = document.getElementById('index-sync-cid');
+    const status = document.getElementById('index-sync-status');
+    const raw = (input?.value || '').trim().replace(/^\/ipfs\//, '');
+    if (!raw) {
+      if (status) status.textContent = 'Paste an index tip CID first.';
+      return;
+    }
+    indexSyncBtn.disabled = true;
+    if (status) status.textContent = `Fetching ${raw}…`;
+    try {
+      const r = await syncIndexFromTip(raw);
+      if (r.action === 'noop') {
+        if (status) status.textContent = `Already current — ${raw} needs no merge.`;
+      } else {
+        if (status) status.textContent = `${r.action === 'merge' ? 'Merged' : 'Adopted'} ${raw} · ${r.merged} new note(s) · tip now ${r.tip}`;
+      }
+    } catch (err) {
+      if (status) status.textContent = `Sync failed for ${raw}: ${err.message}`;
+    } finally {
+      indexSyncBtn.disabled = false;
+    }
+  });
 }
 
 function renderIssues() {
