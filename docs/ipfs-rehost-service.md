@@ -80,22 +80,36 @@ configuration and needs no public instance at all.
 
 ## Build phases
 
-1. **`scripts/rehost-service.mjs`** — the tier-1 service: `POST /rehost`,
-   camo's rules ported (MIME whitelist, size cap, redirect depth,
-   timeout, cookie strip, Via self-guard, SSRF guard rejecting
-   private/loopback ranges), Kubo RPC add with block-put fallback,
-   URL→CID JSON cache, optional HMAC minting. Tests spin a fixture
-   origin: round trip, MIME/size/redirect/SSRF rejections, HMAC
-   accept/reject.
-2. **`js/rehost.js` + renderer wiring** — `rehostAndRewrite(imgUrl)`
-   with localStorage cache; used by the markdown renderer when the
-   image policy is "rehost"; graceful fallback to the policy's other
-   mode on failure.
-3. **Tier 2** — `rehost` op in the rust interop server (rust fetches,
-   the bridge adds), so the desktop app is a self-contained rehoster.
-4. **Index on the issues chain** — `rehost` notes, signed, synced via
-   the existing index machinery; a `rehost-mirror` script that walks
-   the index and pins everything (availability without the origin).
+1. ~~**`scripts/rehost-service.mjs`**~~ SHIPPED (tier 1): `POST /rehost`
+   (+ `GET ?url=`), camo's rules ported (MIME whitelist, 5 MB declared +
+   streamed cap, 4-redirect depth, 10 s timeout, cookie strip, Via
+   self-guard, SSRF guard — private/loopback refused unless
+   `REHOST_ALLOW_PRIVATE=1`, optional `CAMO_KEY` HMAC minting), CID
+   computed in-process (@helia/unixfs raw-leaf CIDv1), optional Kubo
+   pin, URL→CID JSON cache. Tests `tests/rehost-service.test.mjs` (9):
+   fixture origin, byte-identical round trip, every rejection class,
+   cache, HMAC. Run: `PORT=8081 node scripts/rehost-service.mjs`.
+2. ~~**`js/rehost.js`**~~ SHIPPED (module): `shouldRehost` (plain remote
+   http(s) only — ipfs://, data:, and relative URLs are already
+   content-addressed/inline/local), `rehostedSrc` (gateway form for src),
+   `rehostAndRewrite` (POST → `{cid, src, ipfsUri}` or null on any
+   failure — the caller falls back), injectable fetch/cache, unit-tested
+   (tests/rehost.test.mjs, 5). The renderer wiring itself lands with the
+   markdown image-policy decision.
+3. ~~**Tier 2**~~ SHIPPED (bridge form): the camo rules moved to the
+   shared `js/camo-fetch.js` (environment-agnostic — node service and
+   webview use the identical rulebook), and the bridge gained a `rehost`
+   op (js/ipfs-node.js): fetch on the user's machine → add via the
+   in-webview Helia → `{cid, size, contentType}`. No rust TLS stack
+   added (the desktop bundle stays lean); the TUI reaches it via the
+   `:` bar.
+4. ~~**Index on the issues chain**~~ SHIPPED: `recordRehost(url, cid)`
+   in main.js signs + publishes + extends the chain with
+   `{ns:'rehost', url, cid, timestamp}` (the renderer calls it when the
+   image policy is "rehost"), and `scripts/rehost-mirror.mjs <tipCid>
+   [--dry-run]` walks the chain (Kubo RPC → gateway block sources),
+   keeping the NEWEST rehost per URL, and pins the set on Kubo.
+   Tests: tests/rehost-mirror.test.mjs (3).
 
 ## Verification
 
