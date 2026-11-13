@@ -39,7 +39,10 @@ A superproject commit whose gitlink points at an UNPUSHED submodule commit
 breaks every `submodules: recursive` checkout of that ref — CI dies inside
 actions/checkout with "upload-pack: not our ref <sha>", far from the cause.
 The order is always: submodule branch, submodule tag (releases), THEN the
-superproject. Verify before any superproject push:
+superproject. Within the superproject, push the release TAG before MAIN:
+the shared deploy workflow triggers on the main push and auto-detects the
+newest `v*` tag — main first would deploy the previous release. Verify
+before any superproject push:
 
 ```
 node scripts/check-gitlink.mjs
@@ -80,8 +83,10 @@ Page-wide patterns. Keep them; new UI gets them for free or not at all.
   `chip-car-export`, `issue-pin-cmd`). Repo metadata (branch/tag counts,
   stars, forks) is always fetched per-repo at runtime — this app is a
   plugin for ANY GitHub repo, so no repo-specific value may be hardcoded;
-  when the API is unreachable, fall back to a neutral label, never a fake
-  number.
+  when the API is unreachable, show nothing or a content-free placeholder
+  (—), never a fake number, and never a static label that claims a value
+  (user override: the branches/tags count links stay hidden until live
+  data arrives).
 - **Full values**: never truncate CIDs, hashes, peer IDs, URLs for display;
   let the UI wrap (user override: gitlink markers in the file tree use
   GitHub's `@<short>` convention next to the folder name).
@@ -98,10 +103,15 @@ npm run release <semver>
 commits, tags, and keeps the `actions-test` submodule in lockstep: it commits
 pending submodule changes, pushes its branch, tags it with the same release
 tag, and bumps the superproject gitlink. The fixture's
-`actions-test/.github/workflows/deploy.yml` stays in lockstep with the repo's
-`consumer.example.yml`: `scripts/install-consumer-example.mjs` installs one as
-the other on every release AND before every CAR build (it is wired into the
-build script), so the fixture always consumes the release being cut — the
-workflow auto-detects the newest `v*` tag, which is that release once the
-tag is pushed. Do not cut a release unless the user asks for one; a commit
-is just a snapshot, not a release.
+`actions-test/.github/workflows/deploy.yml` stays in lockstep with the
+repo's own `.github/workflows/deploy-gh-pages.yml` (the single deploy
+workflow this repo and its consumers share): `scripts/install-consumer-example.mjs`
+installs one as the other on every release AND before every CAR build (it
+is wired into the build script), so the fixture always consumes the
+release being cut — the workflow auto-detects the newest `v*` tag, which
+is that release once the tag is pushed. Do not cut a release unless the
+user asks for one; a commit is just a snapshot, not a release.
+
+Workflow/CI details and the consumer-contract gotchas (deploy workflow
+shape, tag-before-main, the skipped-`needs` trap, pinning providers, CI
+suite hangs, consumer testing) live in `.github/AGENTS.md`.

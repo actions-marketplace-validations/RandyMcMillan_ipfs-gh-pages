@@ -1,6 +1,7 @@
 // GitHub-like markdown rendering (docs/markdown-rendering.md — decisions:
-// marked+DOMPurify, SVG <img>-only, rehost-first images, sanitize+CSP for
-// repo content, sandboxed iframe for network content).
+// marked+DOMPurify, inline SVG temporarily re-enabled + SVG <img>,
+// rehost-first images, sanitize+CSP for repo content, sandboxed iframe
+// for network content).
 //
 // The pipeline: marked (GFM) → DOMPurify (namespace-aware, ≥3.2.4) → DOM
 // rewrite pass (repo-relative links/images resolved against the embedded
@@ -10,11 +11,14 @@
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 
-// GitHub-ish config: no scripts/handlers/style, NO inline SVG or MathML
-// (mXSS surface — SVG only ever renders via <img>), embedders/forms out.
-// `align` stays (GitHub allows it). ipfs:/ipns: schemes stay usable.
+// GitHub-ish config: no scripts/handlers/style, no MathML (mXSS surface).
+// TEMPORARY: inline <svg> is re-enabled through DOMPurify's default SVG
+// profile (scripts, event handlers, embedders still stripped by the
+// allowlist) — see docs/markdown-rendering.md. SVG images still also
+// render via <img>. `align` stays (GitHub allows it). ipfs:/ipns: schemes
+// stay usable.
 const PURIFY_CONFIG = {
-  FORBID_TAGS: ['style', 'script', 'iframe', 'object', 'embed', 'svg', 'math', 'form', 'input', 'button', 'textarea', 'select', 'link', 'meta', 'base', 'frame'],
+  FORBID_TAGS: ['style', 'script', 'iframe', 'object', 'embed', 'math', 'form', 'input', 'button', 'textarea', 'select', 'link', 'meta', 'base', 'frame'],
   ADD_ATTR: ['align'],
   ALLOWED_URI_REGEXP: /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|ipfs|ipns):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i
 };
@@ -75,14 +79,25 @@ export function rewriteRendered(container, { onEmbed, rehost, onRepoLink } = {})
     const decision = classifyUrl(img.getAttribute('src'), { mdDirPath: mdDir });
     if (decision.kind === 'embed' && onEmbed) {
       const dataUrl = onEmbed(decision.path);
-      if (dataUrl) img.setAttribute('src', dataUrl);
+      if (dataUrl && typeof dataUrl.then === 'function') {
+        // Async source (car mode: bytes come from repo.car) — inert
+        // placeholder until the bytes arrive, then swap the data: URL in.
+        img.setAttribute('src', 'data:,');
+        dataUrl.then((url) => { if (url) img.setAttribute('src', url); }).catch(() => {});
+      } else if (dataUrl) img.setAttribute('src', dataUrl);
       else img.setAttribute('src', 'data:,'); // missing from bundle — inert
     } else if (decision.kind === 'rehost' && rehost) {
-      img.setAttribute('data-rehost-src', img.getAttribute('src'));
+      const origSrc = img.getAttribute('src');
+      img.setAttribute('data-rehost-src', origSrc);
       img.setAttribute('src', 'data:,');
-      rehost(img.getAttribute('data-rehost-src')).then((out) => {
+      img.setAttribute('referrerpolicy', 'no-referrer');
+      rehost(origSrc).then((out) => {
+        // Rehost service answers (e.g. the viewer runs one locally): serve
+        // the content-addressed copy. No service (every deployed page):
+        // direct load so images actually render — the origin sees the
+        // viewer either way once it serves the bytes.
         if (out && out.src) img.setAttribute('src', out.src);
-        else img.setAttribute('alt', `${img.getAttribute('alt') || 'image'} (rehost failed — blocked)`);
+        else img.setAttribute('src', origSrc);
       });
     } else if (decision.kind === 'block') {
       img.setAttribute('src', 'data:,');

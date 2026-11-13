@@ -1,6 +1,6 @@
-# Helia IPFS - Browser Self-Hosting
+# Helia IPFS - [deploy-gh-pages](deploy-gh-pages.yml)
 
-[![Deploy Helia App to GitHub Pages](https://github.com/RandyMcMillan/ipfs-gh-pages/actions/workflows/this-repo-pages-deploy.yml/badge.svg)](https://github.com/RandyMcMillan/ipfs-gh-pages/actions/workflows/this-repo-pages-deploy.yml)
+[![Deploy IPFS site](https://github.com/RandyMcMillan/ipfs-gh-pages/actions/workflows/deploy-gh-pages.yml/badge.svg)](https://github.com/RandyMcMillan/ipfs-gh-pages/actions/workflows/deploy-gh-pages.yml)
 [![Release](https://github.com/RandyMcMillan/ipfs-gh-pages/actions/workflows/release.yml/badge.svg)](https://github.com/RandyMcMillan/ipfs-gh-pages/actions/workflows/release.yml)
 
 A browser-based IPFS node built with [Helia](https://github.com/ipfs/helia) that runs entirely on GitHub Pages. On load it automatically adds every file in the repository to IPFS and exposes a root CID, plus a browsable file tree, content fetch, and download support.
@@ -65,12 +65,12 @@ Release procedure with submodules:
 
 1. To update the fixture's content: commit and push inside the
    submodule, then bump the gitlink here (the normal two-step).
-2. Every build installs `consumer.example.yml` as the fixture's
-   `actions-test/.github/workflows/deploy.yml` — the two stay in
-   lockstep, so the fixture consumes the same self-updating workflow
-   linked above — then rebuilds every submodule CAR from the checked-out
-   commit. The CAR's root CID changes only when the submodule's
-   tracked files change.
+2. Every build installs the repo's own `.github/workflows/deploy-gh-pages.yml`
+   as the fixture's `actions-test/.github/workflows/deploy.yml` — one
+   deploy workflow shared by this repo, its consumers, and the fixture
+   (the repo-root `deploy-gh-pages.yml` is a symlink to it) — then
+   rebuilds every submodule CAR from the checked-out commit. The CAR's
+   root CID changes only when the submodule's tracked files change.
 3. CI checkouts that don't initialize submodules skip the submodule
    CARs gracefully; the main `dist/ipfs-gh-pages.car` is unaffected.
 
@@ -130,7 +130,7 @@ jobs:
 
       - name: Build and deploy IPFS site
         id: deploy
-        uses: RandyMcMillan/ipfs-gh-pages@v2.9.0
+        uses: RandyMcMillan/ipfs-gh-pages@v3.1.0
         with:
           node-version: '20'
           deploy: 'true'
@@ -138,8 +138,11 @@ jobs:
 
 The example above pins a release tag. A self-updating variant — it auto-detects the
 newest `v*` tag of this action at run time (falling back to the default-branch HEAD),
-and takes an explicit pin via `workflow_dispatch` — lives in
-[`consumer.example.yml`](https://github.com/RandyMcMillan/ipfs-gh-pages/blob/main/consumer.example.yml).
+and takes an explicit pin via `workflow_dispatch` — is the very workflow this repo
+deploys itself with:
+[`.github/workflows/deploy-gh-pages.yml`](https://github.com/RandyMcMillan/ipfs-gh-pages/blob/main/.github/workflows/deploy-gh-pages.yml)
+(copy it as `.github/workflows/deploy.yml`; a `deploy-gh-pages.yml` symlink at the
+repo root points at the same file).
 
 Inputs:
 
@@ -149,6 +152,7 @@ Inputs:
 - `deploy` (default `true`) — whether to deploy to GitHub Pages.
 - `run-tests` (default `false`) — run the integration suite (installs Chromium) before building.
 - `pinata-jwt` (default empty) — a Pinata JWT, normally passed as a repo secret (`pinata-jwt: ${{ secrets.PINATA_JWT }}`). When set, the built `ipfs-gh-pages.car` is pinned to Pinata's public IPFS network (`car=true` — the CAR's roots are what gets pinned). Empty = skipped; failures only warn (optional service).
+- `filebase-access-key-id` / `filebase-secret-access-key` / `filebase-bucket` (default empty) — Filebase credentials in Filebase's own terms (`accessKeyId` / `secretAccessKey` from the dashboard → Access Keys, plus your bucket), normally repo secrets `FILEBASE_ACCESS_KEY_ID`, `FILEBASE_SECRET_ACCESS_KEY`, `FILEBASE_BUCKET`. When all three are set, the built `ipfs-gh-pages.car` is pinned to Filebase's IPFS network via an S3 `PUT` (endpoint `https://s3.filebase.io`, region `auto`, signature v4; the pinned CID comes back in the `x-amz-meta-cid` header). Empty = skipped; failures only warn (optional service).
 
 Outputs:
 
@@ -159,7 +163,7 @@ the Pages deployment step.
 
 ## CI / CD
 
-- `.github/workflows/this-repo-pages-deploy.yml` runs the full test suite on every push and pull request; deployment to GitHub Pages only happens on `main` after tests pass.
+- `.github/workflows/deploy-gh-pages.yml` is the deploy workflow — this repo runs it as its own deploy, and consumers copy the same file (auto-detects the newest `v*` tag of the action at run time). It deploys on every push to `main` and re-checks daily.
 - `.github/workflows/release.yml` runs tests, builds the project, archives `./dist` as `dist.zip`, and attaches it to a GitHub Release (triggered by `v*` tags or manually).
 
 ## Project Structure

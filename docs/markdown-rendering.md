@@ -102,6 +102,14 @@ decides everything:
   render SVG via `<img>`/blob URL only, never inline; the blob view's
   image preview must not inline SVG either.
 
+> **TEMPORARY (2026-11-12, commit pending):** inline `<svg>` in markdown
+> is re-enabled through DOMPurify's default SVG profile — scripts, event
+> handlers, and executable schemes are still stripped by the allowlist,
+> but `<svg>`/`<circle>`/etc. now render. MathML stays forbidden. This is
+> a deliberate short-term revert of the rule above; the residual risk is
+> DOMPurify's SVG/foreignObject attack surface. Restore the forbid when
+> the need passes.
+
 ### Image smuggling (privacy + exfiltration)
 
 - **Tracking pixels**: every remote `<img>` beacons viewer IP, user-
@@ -205,8 +213,10 @@ Corrections adopted from verification:
 
 1. **Image policy: rehost-first.** Remote images go through the rehost
    service (fetch-once → content-addressed URL, recorded on the chain);
-   a failed rehost BLOCKS the image (alt text) rather than beaconing the
-   origin. `js/rehost.js` + `scripts/rehost-service.mjs`.
+   when no service answers (every deployed page), the image falls back to
+   DIRECT load with `referrerpolicy="no-referrer"` — blocked images are
+   broken pages, and the origin serves the bytes either way.
+   `js/rehost.js` + `scripts/rehost-service.mjs`.
 2. **SVG policy: `<img>`-only.** DOMPurify config forbids inline
    `<svg>`/`<math>` outright — no SVG-sanitizer profile to keep perfect.
 3. **Network content (issue bodies/comments, fetched docs): sandboxed
